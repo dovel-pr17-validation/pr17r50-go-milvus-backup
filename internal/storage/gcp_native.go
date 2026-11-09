@@ -1,0 +1,239 @@
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"os"
+	"strings"
+
+	"cloud.google.com/go/storage"
+	"go.uber.org/zap"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/retry"
+)
+
+var _ Client = (*GCPNativeClient)(nil)
+
+type GCPNativeClient struct {
+	client *storage.Client
+
+	projectID string
+	cfg       Config
+}
+
+func (gcm *GCPNativeClient) UploadObject(ctx context.Context, i UploadObjectInput) error {
+	wc := gcm.client.Bucket(gcm.cfg.Bucket).Object(i.Key).NewWriter(ctx)
+	defer func() {
+		if err := wc.Close(); err != nil {
+			log.Error("Failed to close writer", zap.Error(err))
+		}
+	}()
+
+	if _, err := io.Copy(wc, i.Body); err != nil {
+		return fmt.Errorf("storage: gcp native upload object: %w", err)
+	}
+
+	return nil
+}
+
+func (gcm *GCPNativeClient) CopyObject(ctx context.Context, i CopyObjectInput) error {
+	srcCli, ok := i.SrcCli.(*GCPNativeClient)
+	if !ok {
+		return fmt.Errorf("storage: gcp native copy object only supports a gcp native source client")
+	}
+
+	srcObj := gcm.client.Bucket(srcCli.cfg.Bucket).Object(i.SrcAttr.Key)
+	dstObj := gcm.client.Bucket(gcm.cfg.Bucket).Object(i.DestKey)
+
+	if _, err := dstObj.CopierFrom(srcObj).Run(ctx); err != nil {
+		return fmt.Errorf("storage: gcp native copy object from %s to %s: %w", i.SrcAttr.Key, i.DestKey, err)
+	}
+
+	return nil
+}
+
+func (gcm *GCPNativeClient) HeadObject(ctx context.Context, key string) (ObjectAttr, error) {
+	obj := gcm.client.Bucket(gcm.cfg.Bucket).Object(key)
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		return ObjectAttr{}, fmt.Errorf("storage: gcp native head object: %w", err)
+	}
+
+	return ObjectAttr{Key: key, Length: attrs.Size}, nil
+}
+
+func (gcm *GCPNativeClient) GetObject(ctx context.Context, key string) (*Object, error) {
+	reader, err := gcm.client.Bucket(gcm.cfg.Bucket).Object(key).NewReader(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("storage: gcp native get object: %w", err)
+	}
+
+	return &Object{Length: reader.Attrs.Size, Body: reader}, nil
+}
+
+func (gcm *GCPNativeClient) DeleteObject(ctx context.Context, key string) error {
+	return retry.Do(ctx, func() error {
+		if err := gcm.client.Bucket(gcm.cfg.Bucket).Object(key).Delete(ctx); err != nil {
+			return fmt.Errorf("storage: gcp native delete object: %w", err)
+		}
+		return nil
+	})
+}
+
+// NewObjectIter constructs the GCS object iterator lazily inside the
+// sequence, so no request is made until the range starts. It fetches pages
+// synchronously and keeps no background goroutine.
+func (gcm *GCPNativeClient) NewObjectIter(ctx context.Context, prefix string, recursive bool) iter.Seq2[ObjectAttr, error] {
+	return func(yield func(ObjectAttr, error) bool) {
+		delimiter := ""
+		if !recursive {
+			delimiter = "/"
+		}
+
+		iter := gcm.client.Bucket(gcm.cfg.Bucket).Objects(ctx, &storage.Query{
+			Prefix:    prefix,
+			Delimiter: delimiter,
+		})
+
+		for {
+			next, err := iter.Next()
+			if err != nil {
+				if errors.Is(err, iterator.Done) {
+					return
+				}
+				yield(ObjectAttr{}, fmt.Errorf("storage: gcp native list prefix: %w", err))
+				return
+			}
+			if !yield(ObjectAttr{Key: next.Name, Length: next.Size}, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (gcm *GCPNativeClient) BucketExist(ctx context.Context, _ string) (bool, error) {
+	bucket := gcm.client.Bucket(gcm.cfg.Bucket)
+	_, err := bucket.Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, storage.ErrBucketNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("storage: gcp native get bucket attrs: %w", err)
+	}
+
+	return true, nil
+}
+
+func (gcm *GCPNativeClient) CreateBucket(ctx context.Context) error {
+	if err := gcm.client.Bucket(gcm.cfg.Bucket).Create(ctx, gcm.projectID, nil); err != nil {
+		return fmt.Errorf("storage: gcp native create bucket: %w", err)
+	}
+	return nil
+}
+
+func (gcm *GCPNativeClient) Config() Config {
+	return gcm.cfg
+}
+
+// isStandardGCSEndpoint reports whether the configured endpoint points at the
+// public Google Cloud Storage service (rather than a custom emulator host).
+//
+// The storage factory in factory.go always builds Config.Endpoint via
+// net.JoinHostPort(address, port), so for a normal GCS backup the endpoint is
+// something like "storage.googleapis.com:443" — never empty. Passing that host
+// to option.WithEndpoint() makes cloud.google.com/go/storage.NewClient treat it
+// as a custom endpoint and inject conflicting auth handling, which collides
+// with the explicit option.WithCredentials() below and fails client init with
+// "dialing: multiple credential options provided".
+//
+// For the standard GCS host the native client must use its own default
+// endpoints, so WithEndpoint must be skipped entirely. WithEndpoint is only
+// appropriate for a genuine non-GCS host (e.g. a fake-gcs-server emulator).
+func isStandardGCSEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return true
+	}
+	host := endpoint
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		// strip the ":port" suffix that net.JoinHostPort always appends
+		host = host[:idx]
+	}
+	return host == "" ||
+		host == "storage.googleapis.com" ||
+		strings.HasSuffix(host, ".storage.googleapis.com") ||
+		host == "www.googleapis.com" ||
+		host == "googleapis.com"
+}
+
+func newGCPNativeClient(ctx context.Context, cfg Config) (*GCPNativeClient, error) {
+	// This client only knows how to read a service account key file. Say so
+	// here: without the check a missing path surfaces as a bare
+	// "storage: gcp native read credentials file: open :" from the read below.
+	if cfg.Credential.Type != GCPCredJSON {
+		return nil, fmt.Errorf("storage: gcp native needs a service account credentials file, got credential type %s",
+			cfg.Credential.Type)
+	}
+
+	var opts []option.ClientOption
+	// Only set a custom endpoint for a genuine non-GCS host (an emulator).
+	// For the standard GCS service we must leave the endpoint unset so the
+	// native client uses its own defaults — otherwise WithEndpoint +
+	// WithCredentials collide ("multiple credential options provided").
+	if !isStandardGCSEndpoint(cfg.Endpoint) {
+		address := "https://"
+		if !cfg.UseSSL {
+			address = "http://"
+		}
+
+		address = address + cfg.Endpoint + "/storage/v1/"
+		opts = append(opts, option.WithEndpoint(address))
+	}
+
+	// Read the credentials file
+	jsonData, err := os.ReadFile(cfg.Credential.GCPCredJSON)
+	if err != nil {
+		return nil, fmt.Errorf("storage: gcp native read credentials file: %w", err)
+	}
+
+	// Only service account keys are supported, getProjectID below requires the
+	// project_id field that only they carry.
+	creds, err := google.CredentialsFromJSONWithType(ctx, jsonData, google.ServiceAccount, storage.ScopeReadWrite)
+	if err != nil {
+		return nil, fmt.Errorf("storage: gcp native create credentials from JSON: %w", err)
+	}
+	projectID, err := getProjectID(jsonData)
+	if err != nil {
+		return nil, fmt.Errorf("storage: gcp native get project id: %w", err)
+	}
+	opts = append(opts, option.WithCredentials(creds))
+
+	client, err := storage.NewClient(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("storage: create gcp native client: %w", err)
+	}
+
+	return &GCPNativeClient{client: client, cfg: cfg, projectID: projectID}, nil
+}
+
+func getProjectID(byts []byte) (string, error) {
+	var data map[string]any
+	if err := json.Unmarshal(byts, &data); err != nil {
+		return "", fmt.Errorf("storage: parse gcp credential json file: %w", err)
+	}
+
+	propertyValue, ok := data["project_id"]
+	if !ok {
+		return "", fmt.Errorf("storage: gcp native get project id: project_id not found in credentials file")
+	}
+
+	projectID := fmt.Sprintf("%v", propertyValue)
+	return projectID, nil
+}

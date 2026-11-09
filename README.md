@@ -1,0 +1,237 @@
+# Milvus Backup
+
+<div align="left">
+  <a href="https://discord.com/invite/8uyFbECzPX"><img height="20" src="https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white" alt="Discord" /></a>
+  <img src="https://img.shields.io/github/license/zilliztech/milvus-backup" alt="License" />
+</div>
+
+Milvus Backup is a command-line tool and API service for backing up and restoring Milvus data. Backup and restore operations run while the Milvus cluster remains available.
+
+## Installation
+
+Download a binary from the [release page](https://github.com/zilliztech/milvus-backup/releases), or install it with Homebrew on macOS:
+
+```shell
+brew install zilliztech/tap/milvus-backup
+```
+
+To build from source instead, run `make all`; the executable is written to `./milvus-backup`.
+
+## Command-line usage
+
+Milvus Backup reads its connection settings from a configuration file. Copy the example and update it for your deployment — [Configuration](#configuration) explains what to change:
+
+```shell
+cp configs/backup.yaml backup.yaml
+```
+
+Then validate the setup and run your first backup and restore:
+
+```shell
+milvus-backup check
+milvus-backup create -n my_backup
+milvus-backup list
+milvus-backup restore -n my_backup
+```
+
+The main commands are:
+
+| Command | Description |
+|---------|-------------|
+| `check` | Validate connections and inspect the resolved configuration. |
+| `create` | Create a backup. |
+| `delete` | Delete a backup by name. |
+| `get` | Show a backup by name. |
+| `list` | List backups in object storage. |
+| `restore` | Restore a backup. |
+| `l0compact` | Convert L0 delete data into a restorable physical backup copy. |
+| `migrate` | Migrate backup data to Zilliz Cloud. |
+| `server` | Start the REST API server. |
+
+Run `milvus-backup <command> --help` for command-specific flags. See the [CLI end-to-end guide](docs/user_guide/e2e_demo_cli.md) for a complete backup and restore example.
+
+### Selecting collections
+
+`--filter` limits a command to some of the collections instead of all of them. It takes a comma-separated list, where an entry is a collection in the default database (`coll1`), a collection in a named database (`db1.coll1`), or every collection in a database (`db1.*`):
+
+```shell
+# back up two collections
+milvus-backup create -n my_backup --filter hello_milvus,db1.hello_milvus2
+
+# back up every collection in db1 (quoted, so the shell does not expand the *)
+milvus-backup create -n my_backup --filter 'db1.*'
+
+# restore the whole backup
+milvus-backup restore -n my_backup
+```
+
+On `restore`, `--filter` names collections as they will exist in the target Milvus, so it matches the name **after** `--suffix` or `--rename` has been applied:
+
+```shell
+# restores hello_milvus from the backup into a new hello_milvus_recover
+milvus-backup restore -n my_backup -s _recover --filter hello_milvus_recover
+
+# restores db1.coll1 into db2.coll1
+milvus-backup restore -n my_backup -r db1.coll1:db2.coll1 --filter db2.coll1
+```
+
+Filtering on the pre-rename name matches nothing and restores nothing.
+
+How a restore moves the data is picked by `--strategy`, whose values name both the backup format and the path: `per_seg` and `merged_seg` for binlog backups (one import job per segment vs. segments merged into fewer jobs), `restore_snap` for snapshot backups (Milvus's own restore api), and `import_snap` for snapshot backups through the v2 import api (Milvus 3.0.4+). The `auto` value, which is also the default, resolves on its own — a binlog backup takes the merged path when the target supports the v2 import api (Milvus 2.5+) and the per-segment path otherwise, and a snapshot backup takes the restore api; `import_snap` is only ever used when pinned explicitly. See [multi-segment merged restore](docs/user_guide/mul_seg_restore.md). The old `--use_v2_restore` flag is deprecated: `true` still selects the merged path, and an explicit `--strategy` wins when both are given.
+
+### Restoring a secondary
+
+Use `restore secondary` to bootstrap a fresh secondary. Keep CDC stopped until restore succeeds. See the [secondary restore guide](docs/user_guide/secondary_restore.md) for backup and restore commands.
+
+Restoring into a cluster that replicates to other clusters (CDC) needs the import jobs committed two-phase, or the target and its secondaries diverge. Pass each secondary with a repeated `--secondary` flag in `address[,token]` form, e.g. `milvus-backup restore -n my_backup --secondary 'http://10.0.0.2:19530,secondary_user:secondary_password' --secondary 'http://10.0.0.3:19530,raw-api-token'`. The raw token is either `username:password` or an API token; omit it to inherit the target's `milvus.user/password`. Every import job is held uncommitted until its mirror appears on every secondary, committed on the restore target, and the replicated commit commits the mirrors (a replication target refuses client-side commits). The RESTful API takes a `secondaries` object array with `address` and optional `token` on `POST /api/v1/restore`. This needs a Milvus 3.0 or newer target with `dataCoord.import.enableInReplicatingCluster=true`; on a replicating target of that version a restore without `--secondary` is refused up front, because the server no longer accepts plain auto-commit import jobs. See [two-phase commit restore](docs/user_guide/two_phase_commit_restore.md) for how it works and the prerequisites.
+
+## Compatibility
+
+Use the [latest release](https://github.com/zilliztech/milvus-backup/releases) whenever possible. The latest version supports backups from Milvus 2.2 and later, and restores to Milvus 2.5 and later.
+
+A backup can be restored only to the same or a newer Milvus version:
+
+| Backup version | Restore to 2.5 | Restore to 2.6 | Restore to 3.0 |
+|----------------|----------------|----------------|----------------|
+| 2.2            | Supported      | Supported      | Supported      |
+| 2.3            | Supported      | Supported      | Supported      |
+| 2.4            | Supported      | Supported      | Supported      |
+| 2.5            | Supported      | Supported      | Supported      |
+| 2.6            | —              | Supported      | Supported      |
+| 3.0            | —              | —              | Supported      |
+
+For example, a backup created from Milvus 2.6 cannot be restored to Milvus 2.5.
+
+### Backup formats
+
+On Milvus 3.0 and later, backups are taken in the snapshot format by default: Milvus freezes each collection into a snapshot, and milvus-backup reads the snapshot's manifest and copies its files to the backup storage itself. Like the binlog format, the copy moves data between any two supported backends; whether it streams through the milvus-backup host or is performed by the storage service follows the same `transfer.mode` policy as the binlog copy. Older servers use the binlog format, and `--format=binlog` selects it explicitly.
+
+Restore moves the bundle the other way with a server-side copy inside one storage service, so restoring a snapshot backup requires the backup storage to be the same service as the target Milvus storage: another bucket, account, or region of the same cloud provider works, but a different provider — or a second self-hosted MinIO — does not, and milvus-backup refuses the restore instead of producing a partial one. On Milvus 3.0.4 and later, pinning `--strategy=import_snap` lifts that restriction: the target reads the backup storage itself, so any reachable service works.
+
+## Configuration
+
+The configuration file tells Milvus Backup how to reach Milvus, the storage used by Milvus, and the backup destination. Its main sections are:
+
+- `milvus`: how to reach Milvus — credentials, the gRPC endpoint and its TLS settings — and under `milvus.storage`, the storage the deployment keeps its data in. The `milvus.etcd` settings are only required when using `--backup_index_extra`. When connecting as a user other than `root`, see [Required Milvus privileges](docs/user_guide/privileges.md).
+- `backup`: where backup data is written, under `backup.storage`, and how much of the backup runs in parallel.
+- `restore`: restore concurrency and temporary file handling.
+- `transfer`: how objects move between the two storage backends.
+- `log`: log level and output settings.
+
+Both storage sections describe a backend the same way, and `backup.storage` inherits anything it does not name from `milvus.storage`. Backing up into the same backend takes little more than a bucket name; `rootPath` is the exception, and always defaults to `backup`.
+
+### Configuration examples
+
+| File | Scenario |
+|------|----------|
+| [backup.yaml](configs/backup.yaml) | MinIO, with every setting spelled out |
+| [backup-s3.yaml](configs/backup-s3.yaml) | Milvus on MinIO, backups on AWS S3 |
+| [backup-gcp.yaml](configs/backup-gcp.yaml) | Google Cloud Storage with a service account |
+| [backup-azure.yaml](configs/backup-azure.yaml) | Azure Blob Storage with an account key |
+| [backup-iam.yaml](configs/backup-iam.yaml) | AWS S3 with an instance role, no keys in the file |
+| [backup-local.yaml](configs/backup-local.yaml) | Milvus on MinIO, backups on a local disk |
+| [backup-local-milvus.yaml](configs/backup-local-milvus.yaml) | Milvus standalone with local storage (`COMMON_STORAGETYPE=local`), backups on MinIO |
+
+Use values that match the Milvus deployment. In common installations, the storage defaults differ:
+
+| Field | Docker Compose | Helm |
+|-------|----------------|------|
+| `milvus.storage.bucketName` | `a-bucket` | `milvus-bucket` |
+| `milvus.storage.rootPath` | `files` | `file` |
+
+Credentials can also be supplied through [environment variables](docs/user_guide/env_variables.md), and any value can be overridden for a single run with `--set`:
+
+```shell
+milvus-backup --set MILVUS_USER=root --set MILVUS_PASSWORD=Milvus list
+milvus-backup --set milvus.grpc.address=milvus-proxy list
+```
+
+Run `milvus-backup config show` to print the resolved configuration along with where each value came from.
+
+### Upgrading an existing configuration file
+
+Configuration files carry a `configVersion`. A file written before it existed still loads — it is read with the older schema and translated, with a warning naming the file. Convert one with:
+
+```shell
+milvus-backup config migrate --config backup.yaml -o backup-v2.yaml
+```
+
+The migration report is written to stderr and lists everything that needs a decision, such as a secret that has to move to a renamed environment variable, or a v1 variable whose parameter now belongs in the file. The converted file goes to stdout, or to `-o`.
+
+## API server
+
+Start the REST API server with:
+
+```shell
+milvus-backup server
+```
+
+It listens on port `8080` by default. Use `-p` to select another port:
+
+```shell
+milvus-backup server -p 8443
+```
+
+The Swagger UI is available at:
+
+```text
+http://localhost:8080/api/v1/docs/index.html
+```
+
+See the [API demo](docs/user_guide/api_demo.md) for example requests. The Swagger UI reflects the current API and should be treated as the authoritative reference.
+
+## Advanced features
+
+- [Storage transfer](docs/user_guide/transfer.md): copy backup data between different storage systems, such as MinIO and AWS S3.
+- [RBAC backup and restore](docs/user_guide/rbac.md): include Milvus RBAC metadata in a backup or restore operation.
+- [Segment merging restore](docs/user_guide/mul_seg_restore.md): group small segments into fewer import jobs to improve restore performance.
+
+### Cross-storage example
+
+The `milvus.storage` settings must match the storage used by Milvus. Describe the backup destination under `backup.storage`:
+
+```yaml
+configVersion: v2
+
+milvus:
+  storage:
+    provider: minio
+    address: localhost
+    port: 9000
+    bucketName: a-bucket
+    rootPath: files
+    auth:
+      type: static
+      accessKeyID: minioadmin
+      secretAccessKey: minioadmin
+
+backup:
+  storage:
+    provider: aws
+    address: s3.us-east-1.amazonaws.com
+    port: 443
+    region: us-east-1
+    useSSL: true
+    bucketName: <your-bucket-name>
+    rootPath: backups
+    auth:
+      type: static
+      accessKeyID: <your-access-key-id>
+      secretAccessKey: <your-secret-access-key>
+```
+
+The two ends are different backends, so the default `transfer.mode` of `auto` streams the objects through milvus-backup rather than asking either service to copy them. See [configs/backup-s3.yaml](configs/backup-s3.yaml) for the complete file.
+
+Do not commit storage credentials to the repository. Prefer environment variables or another secret-management mechanism in production.
+
+## FAQ
+
+See [docs/FAQ.md](docs/FAQ.md) for common issues and troubleshooting advice.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding style, and how to run the test suite.
+
+## License
+
+Milvus Backup is licensed under the Apache License 2.0.

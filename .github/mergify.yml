@@ -1,0 +1,130 @@
+pull_request_rules:
+  - name: Add needs-dco label when DCO check failed
+    conditions:
+      - base~=^(main|v0\.5)$
+      - -status-success=DCO
+    actions:
+      label:
+        remove:
+          - dco-passed
+        add:
+          - needs-dco
+      comment:
+        message: |
+          @{{author}} Thanks for your contribution. Please submit with DCO, see the contributing guide https://github.com/zilliztech/milvus-backup/blob/main/CONTRIBUTING.md#developer-certificate-of-origin-dco.
+
+  - name: Add dco-passed label when DCO check passed
+    conditions:
+      - base~=^(main|v0\.5)$
+      - status-success=DCO
+    actions:
+      label:
+        remove:
+          - needs-dco
+        add:
+          - dco-passed
+
+  - name: Test passed for code changed-main
+    conditions:
+      - base~=^(main|v0\.5)$
+      - check-success=CI summary
+    actions:
+      label:
+        add:
+          - ci-passed
+
+  - name: Test passed for non-code changed
+    conditions:
+      - base~=^(main|v0\.5)$
+      - or:
+        - -files~=^(?!.*\.(md)).*$
+        - -files~=^(?!docs\/).+
+        - -files~=^(?!scripts\/).+
+    actions:
+      label:
+        add:
+          - ci-passed
+
+  - name: Test passed for mergify changed
+    conditions:
+      - base~=^(main|v0\.5)$
+      - -files~=^(?!\.github\/mergify\.yml).*$
+    actions:
+      label:
+        add:
+          - ci-passed
+
+  - name: Add kind/improvement tag for dependabot's PR
+    conditions:
+      - base~=^(main|v0\.5)$
+      - author=dependabot[bot]
+    actions:
+      label:
+        add:
+          - kind/improvement
+        remove:
+          - do-not-merge/missing-related-issue
+
+  - name: Blocking PR if missing a related issue or PR doesn't have kind/improvement label
+    conditions:
+      - base~=^(main|v0\.5)$
+      - and:
+        - -body~=\#[0-9]{1,6}(\s+|$)
+        - -body~=https://github.com/zilliztech/milvus-backup/issues/[0-9]{1,6}(\s+|$)
+      - -label=kind/improvement
+      - -title~=\[automated\]
+      - author!=dependabot[bot]
+    actions:
+      label:
+        add:
+          - do-not-merge/missing-related-issue
+      comment:
+        message: |
+          @{{author}} Please associate the related issue to the body of your Pull Request.  (eg. “issue: #<xyz>”)
+  - name: Dismiss block label if related issue be added into PR
+    conditions:
+      - or:
+        - and:
+          - base~=^(main|v0\.5)$
+          - or:
+            - body~=\#[0-9]{1,6}(\s+|$)
+            - body~=https://github.com/zilliztech/milvus-backup/issues/[0-9]{1,6}(\s+|$)
+        - and:
+          - base~=^(main|v0\.5)$
+          - label=kind/improvement
+    actions:
+      label:
+        remove:
+          - do-not-merge/missing-related-issue
+
+  - name: Dismiss block label if automated create PR
+    conditions:
+      - base~=^(main|v0\.5)$
+      - title~=\[automated\]
+    actions:
+      label:
+        remove:
+          - do-not-merge/missing-related-issue
+
+  - name: Remove ci-passed label when CI fails
+    conditions:
+      - label!=manual-pass
+      - base~=^(main|v0\.5)$
+      - files~=^(?=.*((\.(go|h|cpp)|CMakeLists.txt))).*$
+      - check-success!=CI summary
+    actions:
+      label:
+        remove:
+          - ci-passed
+
+  - name: Backport merged PR to v0.5 when labeled
+    conditions:
+      - base=main
+      - label=needs-cherry-pick-v0.5
+    actions:
+      backport:
+        branches:
+          - v0.5
+        title: "[automated] {{ title }} (backport #{{ number }})"
+        assignees:
+          - "{{ author }}"

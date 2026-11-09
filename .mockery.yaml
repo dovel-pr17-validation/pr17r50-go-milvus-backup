@@ -1,0 +1,24 @@
+template: testify
+filename: "{{.InterfaceName | camelcase | firstLower }}_mock.go"
+packages:
+
+  github.com/milvus-io/milvus-proto/go-api/v3/milvuspb:
+    config:
+      include-auto-generated: true
+      dir: internal/client/milvus
+      pkgname: milvus
+    interfaces:
+      MilvusServiceClient:
+
+  github.com/zilliztech/milvus-backup/internal/client/milvus:
+    interfaces:
+      Grpc:
+      Manage:
+
+  github.com/zilliztech/milvus-backup/internal/storage:
+    interfaces:
+      Client:
+
+  github.com/zilliztech/milvus-backup/core/restore:
+    interfaces:
+      CollMapper:

@@ -1,0 +1,400 @@
+package milvus
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strconv"
+	"time"
+
+	"github.com/imroc/req/v3"
+	"go.uber.org/zap"
+
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/retry"
+)
+
+type ImportState string
+
+const (
+	ImportStatePending     ImportState = "Pending"
+	ImportStateImporting   ImportState = "Importing"
+	ImportStateUncommitted ImportState = "Uncommitted"
+	ImportStateCommitting  ImportState = "Committing"
+	ImportStateCompleted   ImportState = "Completed"
+	ImportStateFailed      ImportState = "Failed"
+)
+
+type BulkInsertV2Input struct {
+	DB             string
+	CollectionName string
+	PartitionName  string
+	Paths          [][]string // offset 0 is path to insertLog file, offset 1 is path to deleteLog file
+	BackupTS       uint64
+	IsL0           bool
+	StorageVersion int64
+	EZK            string
+	// ManualCommit submits the job with auto_commit=false: it stops at
+	// Uncommitted and waits for an explicit CommitImport.
+	ManualCommit bool
+
+	// SourceType selects a metadata source contract for the import. The only
+	// supported value is SourceTypeSnapshot, which turns Paths into exactly one
+	// entry holding one complete snapshot metadata URI. The server rejects a
+	// source type together with BackupTS, StorageVersion or IsL0, so a snapshot
+	// import leaves them all unset.
+	SourceType string
+	// ExternalSpec carries request-scoped credentials for the snapshot source
+	// storage, as the extfs json the snapshot export/restore APIs take. Empty
+	// when the server reads the source with its own storage config.
+	ExternalSpec string
+	// PartitionMapping is a json string mapping every source partition name to
+	// an existing target partition name. Snapshot imports only.
+	PartitionMapping string
+}
+
+// SourceTypeSnapshot makes a bulk import read a snapshot metadata file as its
+// source, the value the server expects under the source_type option key.
+const SourceTypeSnapshot = "snapshot"
+
+func (in *BulkInsertV2Input) opts() map[string]string {
+	opts := map[string]string{"skip_disk_quota_check": "true"}
+
+	if in.ManualCommit {
+		opts["auto_commit"] = "false"
+	}
+
+	if in.BackupTS > 0 {
+		opts["end_ts"] = strconv.FormatUint(in.BackupTS, 10)
+	}
+
+	if in.IsL0 {
+		opts["l0_import"] = "true"
+	} else {
+		opts["backup"] = "true"
+	}
+
+	if in.StorageVersion > 0 {
+		opts["storage_version"] = strconv.FormatInt(in.StorageVersion, 10)
+	}
+
+	if in.EZK != "" {
+		opts["ezk"] = in.EZK
+	}
+
+	if in.SourceType != "" {
+		opts["source_type"] = in.SourceType
+	}
+
+	if in.ExternalSpec != "" {
+		opts["external_spec"] = in.ExternalSpec
+	}
+
+	if in.PartitionMapping != "" {
+		opts["partition_mapping"] = in.PartitionMapping
+	}
+
+	return opts
+}
+
+type ImportDetail struct {
+	FileName     string    `json:"fileName"`
+	FileSize     int       `json:"fileSize"`
+	State        string    `json:"state"`
+	Progress     int       `json:"progress"`
+	CompleteTime time.Time `json:"completeTime"`
+	Reason       string    `json:"reason"`
+}
+
+type GetProcessResp struct {
+	Code int `json:"code"`
+	Data struct {
+		JobId          string `json:"jobId"`
+		CollectionName string `json:"collectionName"`
+		FileName       string `json:"fileName"`
+		FileSize       int    `json:"fileSize"`
+		State          string `json:"state"`
+		Progress       int    `json:"progress"`
+		CompleteTime   string `json:"completeTime"`
+		Reason         string `json:"reason"`
+		TotalRows      int    `json:"totalRows"`
+		Details        []struct {
+			FileName     string `json:"fileName"`
+			FileSize     int    `json:"fileSize"`
+			State        string `json:"state"`
+			Progress     int    `json:"progress"`
+			CompleteTime string `json:"completeTime"`
+			Reason       string `json:"reason"`
+		} `json:"details"`
+	} `json:"data"`
+}
+
+type GetProgressReq struct {
+	DBName string `json:"dbName,omitempty"`
+	JobId  string `json:"jobId"`
+}
+
+// importJobResp is the envelope of the commit and abort endpoints: both carry
+// an empty data object and report the outcome in the code.
+type importJobResp struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type createImportResp struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		JobId string `json:"jobId"`
+	} `json:"data"`
+}
+
+type createImportReq struct {
+	DbName         string            `json:"dbName,omitempty"`
+	CollectionName string            `json:"collectionName"`
+	PartitionName  string            `json:"partitionName,omitempty"`
+	Files          [][]string        `json:"files"`
+	Options        map[string]string `json:"options,omitempty"`
+}
+
+// redacted returns the request as it may appear in logs: the external spec
+// carries source storage credentials, and the ezk is a key, so both are
+// masked. The mask is total on purpose — see cfg maskSecret.
+func (r createImportReq) redacted() createImportReq {
+	if r.Options == nil {
+		return r
+	}
+	masked := make(map[string]string, len(r.Options))
+	for k, v := range r.Options {
+		if k == "external_spec" || k == "ezk" {
+			v = "****"
+		}
+		masked[k] = v
+	}
+	r.Options = masked
+	return r
+}
+
+type getSegmentInfoResp struct {
+	Code int `json:"code"`
+	Data struct {
+		SegmentInfos []SegmentInfo `json:"segmentInfos"`
+	} `json:"data"`
+}
+
+type getSegmentInfoReq struct {
+	DbName       string  `json:"dbName"`
+	CollectionID int64   `json:"collectionId"`
+	SegmentIDs   []int64 `json:"segmentIds"`
+}
+
+type BinlogInfo struct {
+	FieldID int64   `json:"fieldID"`
+	LogIDs  []int64 `json:"logIDs"`
+}
+
+type SegmentInfo struct {
+	CollectionID int64        `json:"collectionID"`
+	DeltaLogs    []BinlogInfo `json:"deltaLogs"`
+	InsertLogs   []BinlogInfo `json:"insertLogs"`
+	IsSorted     bool         `json:"isSorted"`
+	Level        int          `json:"level"`
+	NumRows      int          `json:"numRows"`
+	PartitionID  int64        `json:"partitionID"`
+	SegmentID    int64        `json:"segmentID"`
+	State        int          `json:"state"`
+	StatsLogs    []BinlogInfo `json:"statsLogs"`
+	VChannel     string       `json:"vChannel"`
+}
+
+type Restful interface {
+	BulkInsert(ctx context.Context, input BulkInsertV2Input) (string, error)
+	GetBulkInsertState(ctx context.Context, db, jobID string) (*GetProcessResp, error)
+	GetSegmentInfo(ctx context.Context, db string, collID, segID int64) (*SegmentInfo, error)
+	// CommitImport and AbortImport drive the two-phase commit of an import job
+	// created with auto_commit=false. Both take effect per job.
+	CommitImport(ctx context.Context, db, jobID string) error
+	AbortImport(ctx context.Context, db, jobID string) error
+}
+
+var _ Restful = (*RestfulClient)(nil)
+
+type RestfulClient struct {
+	cli *req.Client
+}
+
+func (r *RestfulClient) BulkInsert(ctx context.Context, input BulkInsertV2Input) (string, error) {
+	createReq := createImportReq{
+		DbName:         input.DB,
+		CollectionName: input.CollectionName,
+		PartitionName:  input.PartitionName,
+		Files:          input.Paths,
+		Options:        input.opts(),
+	}
+	var createResp createImportResp
+	log.Info("send create import job via restful", zap.Any("createReq", createReq.redacted()))
+	resp, err := r.cli.R().
+		SetHeader("Request-Timeout", "600").
+		SetContext(ctx).
+		SetBody(createReq).
+		SetSuccessResult(&createResp).
+		Post("/v2/vectordb/jobs/import/create")
+	if err != nil {
+		return "", fmt.Errorf("client: failed to create import job via restful: %w", err)
+	}
+	log.Info("create import job via restful done", zap.Any("createResp", resp))
+	if resp.IsErrorState() {
+		return "", fmt.Errorf("client: failed to create import job via restful: %v", resp)
+	}
+	if createResp.Code != 0 {
+		return "", fmt.Errorf("client: failed to create import job via restful: %v", createResp)
+	}
+
+	return createResp.Data.JobId, nil
+}
+
+func (r *RestfulClient) GetBulkInsertState(ctx context.Context, dbName, jobID string) (*GetProcessResp, error) {
+	var getResp GetProcessResp
+	getReq := &GetProgressReq{DBName: dbName, JobId: jobID}
+
+	err := retry.Do(ctx, func() error {
+		resp, err := r.cli.R().
+			SetContext(ctx).
+			SetBody(getReq).
+			SetSuccessResult(&getResp).
+			Post("/v2/vectordb/jobs/import/describe")
+		if err != nil {
+			return fmt.Errorf("client: get import job state via restful: %w", err)
+		}
+		log.Debug("get import job state via restful", zap.Any("getResp", resp))
+		if resp.IsErrorState() {
+			return fmt.Errorf("client: get import job state via restful: %v", resp)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &getResp, nil
+}
+
+// CommitImport commits an import job that is holding at Uncommitted, making its
+// data visible. Committing is idempotent — Committing and Completed jobs answer
+// success — so transport-level failures are retried. A non-zero code is a
+// definitive refusal (the job is in a state that cannot be committed) and is
+// returned without retrying.
+func (r *RestfulClient) CommitImport(ctx context.Context, dbName, jobID string) error {
+	return r.postImportJobAction(ctx, "/v2/vectordb/jobs/import/commit", dbName, jobID)
+}
+
+// AbortImport rolls back an import job that has not been committed, dropping
+// whatever it staged. Aborting a job that already failed is accepted; aborting
+// a committed one is refused, and the caller is expected to know the difference
+// — abort only runs on the not-yet-committed path.
+func (r *RestfulClient) AbortImport(ctx context.Context, dbName, jobID string) error {
+	return r.postImportJobAction(ctx, "/v2/vectordb/jobs/import/abort", dbName, jobID)
+}
+
+func (r *RestfulClient) postImportJobAction(ctx context.Context, path, dbName, jobID string) error {
+	actionReq := &GetProgressReq{DBName: dbName, JobId: jobID}
+
+	return retry.Do(ctx, func() error {
+		var actionResp importJobResp
+		resp, err := r.cli.R().
+			SetContext(ctx).
+			SetBody(actionReq).
+			SetSuccessResult(&actionResp).
+			Post(path)
+		if err != nil {
+			return fmt.Errorf("client: post %s via restful: %w", path, err)
+		}
+		log.Info("post import job action via restful",
+			zap.String("path", path), zap.String("job_id", jobID), zap.Any("resp", actionResp))
+		if resp.IsErrorState() {
+			return fmt.Errorf("client: post %s via restful: %v", path, resp)
+		}
+		if actionResp.Code != 0 {
+			return retry.Unrecoverable(fmt.Errorf("client: post %s via restful: %v", path, actionResp))
+		}
+
+		return nil
+	})
+}
+
+func (r *RestfulClient) GetSegmentInfo(ctx context.Context, db string, collID, segID int64) (*SegmentInfo, error) {
+	getReq := getSegmentInfoReq{DbName: db, CollectionID: collID, SegmentIDs: []int64{segID}}
+	var getResp getSegmentInfoResp
+
+	resp, err := r.cli.R().
+		SetContext(ctx).
+		SetBody(getReq).
+		SetSuccessResult(&getResp).
+		Post("/v2/vectordb/segments/describe")
+	if err != nil {
+		return nil, fmt.Errorf("client: failed to get segment info via restful: %w", err)
+	}
+	log.Debug("get segment info via restful", zap.Any("getResp", resp))
+	if resp.IsErrorState() {
+		return nil, fmt.Errorf("client: failed to get segment info via restful: %v", resp)
+	}
+
+	if len(getResp.Data.SegmentInfos) == 0 {
+		return nil, fmt.Errorf("client: no segment info found for segment id %d", segID)
+	}
+	if getResp.Code != 0 {
+		return nil, fmt.Errorf("client: failed to get segment info via restful: %v", getResp)
+	}
+
+	return &getResp.Data.SegmentInfos[0], nil
+}
+
+func restfulAuth(username, password string) string {
+	if username != "" || password != "" {
+		return fmt.Sprintf("%s:%s", username, password)
+	}
+
+	return ""
+}
+
+func NewRestful(c *cfg.MilvusConfig) (*RestfulClient, error) {
+	return newRestful(c, restfulAuth(c.User.Val, c.Password.Val))
+}
+
+// NewRestfulWithToken authenticates with a raw Milvus token, either
+// username:password or an API token. The caller supplies neither a Bearer
+// prefix nor base64 encoding; the REST transport adds the Bearer prefix.
+func NewRestfulWithToken(c *cfg.MilvusConfig, token string) (*RestfulClient, error) {
+	return newRestful(c, token)
+}
+
+func newRestful(c *cfg.MilvusConfig, auth string) (*RestfulClient, error) {
+	baseURL := restfulBaseURL(c)
+	log.Info("new milvus restful client", zap.String("baseURL", baseURL))
+
+	cli := req.C().SetBaseURL(baseURL)
+	if len(auth) != 0 {
+		cli.SetCommonBearerAuthToken(auth)
+	}
+
+	return &RestfulClient{cli: cli}, nil
+}
+
+// restfulBaseURL uses the configured REST endpoint, and derives one from the
+// gRPC connection when none is set, which covers the deployments where a single
+// proxy serves both protocols.
+func restfulBaseURL(c *cfg.MilvusConfig) string {
+	if endpoint := c.Rest.Endpoint.Val; endpoint != "" {
+		return endpoint
+	}
+
+	host := net.JoinHostPort(c.Grpc.Address.Val, strconv.Itoa(c.Grpc.Port.Val))
+	if c.Grpc.TLSMode.Val == cfg.TLSDisabled {
+		return "http://" + host
+	}
+
+	return "https://" + host
+}

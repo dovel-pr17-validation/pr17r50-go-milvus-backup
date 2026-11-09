@@ -1,0 +1,2635 @@
+import time
+import pytest
+import json
+import numpy as np
+import ml_dtypes
+import pandas as pd
+import random
+from collections import defaultdict
+from pymilvus import db, list_collections, Collection, DataType, Function, FunctionType
+from base.client_base import TestcaseBase
+from common import common_func as cf
+from common import common_type as ct
+from common.common_type import CaseLabel
+from utils.util_log import test_log as log
+from utils.util_common import analyze_documents
+from utils.util_pymilvus import create_index_for_vector_fields, create_json_path_index_for_json_fields
+from api.milvus_backup import MilvusBackupClient
+from faker import Faker
+
+fake_en = Faker("en_US")
+prefix = "restore_backup"
+backup_prefix = "backup"
+suffix = "_bak"
+
+
+class TestRestoreBackup(TestcaseBase):
+    """Test case of end to end"""
+
+    @pytest.mark.parametrize("nb", [3000])
+    @pytest.mark.parametrize("is_auto_id", [True])
+    @pytest.mark.parametrize("enable_partition", [False])
+    @pytest.mark.parametrize("is_async", [True, False])
+    @pytest.mark.parametrize("collection_need_to_restore", [3])
+    @pytest.mark.parametrize("collection_type", ["all"])
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_back(
+        self,
+        use_v2_restore,
+        collection_type,
+        collection_need_to_restore,
+        is_async,
+        is_auto_id,
+        enable_partition,
+        nb,
+        nullable
+    ):
+
+        # prepare data
+        names_origin = []
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        if collection_type == "all":
+            for is_binary in [True, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                    nullable=nullable
+                )
+        if collection_type == "float":
+            for is_binary in [False, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                    nullable=nullable
+                )
+        if collection_type == "binary":
+            for is_binary in [True, True, True]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                )
+        log.info(f"name_origin:{names_origin}, back_up_name: {back_up_name}")
+        for name in names_origin:
+            res, _ = self.utility_wrap.has_collection(name)
+            assert res is True
+        # create backup
+        names_need_backup = names_origin
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": names_need_backup,
+        }
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        restore_collections = backup_collections
+        if collection_need_to_restore == "all":
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+            }
+        else:
+            restore_collections = names_need_backup[:collection_need_to_restore]
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+                "collection_names": restore_collections,
+            }
+        payload["useV2Restore"] = use_v2_restore
+        t0 = time.time()
+        res = self.client.restore_backup(payload)
+        restore_id = res["data"]["id"]
+        log.info(f"restore_backup: {res}")
+        if is_async:
+            res = self.client.wait_restore_complete(restore_id)
+            assert res is True
+        t1 = time.time()
+        log.info(f"restore {restore_collections} cost time: {t1 - t0}")
+        res, _ = self.utility_wrap.list_collections()
+        for name in restore_collections:
+            assert name + suffix in res
+        for name in restore_collections:
+            self.compare_collections(name, name + suffix, verify_by_query=True)
+
+    @pytest.mark.parametrize("nb", [3000])
+    @pytest.mark.parametrize("is_auto_id", [True])
+    @pytest.mark.parametrize("enable_partition", [False])
+    @pytest.mark.parametrize("is_async", [True, False])
+    @pytest.mark.parametrize("collection_need_to_restore", [3])
+    @pytest.mark.parametrize("collection_type", ["all"])
+    @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_back_with_index(
+        self,
+        collection_type,
+        collection_need_to_restore,
+        is_async,
+        is_auto_id,
+        enable_partition,
+        nb,
+        nullable
+    ):
+        # prepare data
+        names_origin = []
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        if collection_type == "all":
+            for is_binary in [True, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                    nullable=nullable
+                )
+        if collection_type == "float":
+            for is_binary in [False, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                    nullable=nullable
+                )
+        if collection_type == "binary":
+            for is_binary in [True, True, True]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                )
+        log.info(f"name_origin:{names_origin}, back_up_name: {back_up_name}")
+        for name in names_origin:
+            res, _ = self.utility_wrap.has_collection(name)
+            assert res is True
+
+        # create index for source collections
+        for name in names_origin:
+            c = Collection(name)
+            create_index_for_vector_fields(c)
+        # create json path index for json field of source collections
+        for name in names_origin:
+            c = Collection(name)
+            create_json_path_index_for_json_fields(c)
+
+        # create backup
+        names_need_backup = names_origin
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": names_need_backup,
+        }
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        restore_collections = backup_collections
+        if collection_need_to_restore == "all":
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+            }
+        else:
+            restore_collections = names_need_backup[:collection_need_to_restore]
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+                "collection_names": restore_collections,
+            }
+        payload["restoreIndex"] = True
+        t0 = time.time()
+        res = self.client.restore_backup(payload)
+        restore_id = res["data"]["id"]
+        log.info(f"restore_backup: {res}")
+        if is_async:
+            res = self.client.wait_restore_complete(restore_id)
+            assert res is True
+        t1 = time.time()
+        log.info(f"restore {restore_collections} cost time: {t1 - t0}")
+        res, _ = self.utility_wrap.list_collections()
+        for name in restore_collections:
+            assert name + suffix in res
+        for name in restore_collections:
+            self.compare_indexes(name, name + suffix)
+        for name in restore_collections:
+            self.compare_collections(name, name + suffix, verify_by_query=True, skip_index=True)
+
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("nb", [3000])
+    @pytest.mark.parametrize("is_auto_id", [True])
+    @pytest.mark.parametrize("enable_partition", [True])
+    @pytest.mark.parametrize("is_async", [True])
+    @pytest.mark.parametrize("collection_need_to_restore", [1])
+    @pytest.mark.parametrize("collection_type", ["all"])
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_back_with_multi_partition(
+        self,
+        collection_type,
+        collection_need_to_restore,
+        is_async,
+        is_auto_id,
+        enable_partition,
+        nb,
+    ):
+        # prepare data
+        names_origin = []
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        if collection_type == "all":
+            for is_binary in [True, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                )
+        if collection_type == "float":
+            for is_binary in [False, False, False]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                )
+        if collection_type == "binary":
+            for is_binary in [True, True, True]:
+                names_origin.append(cf.gen_unique_str(prefix))
+                self.prepare_data(
+                    names_origin[-1],
+                    nb=nb,
+                    is_binary=is_binary,
+                    auto_id=is_auto_id,
+                    check_function=False,
+                    enable_partition=enable_partition,
+                )
+        log.info(f"name_origin:{names_origin}, back_up_name: {back_up_name}")
+        for name in names_origin:
+            res, _ = self.utility_wrap.has_collection(name)
+            assert res is True
+        # create backup
+
+        names_need_backup = names_origin
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": names_need_backup,
+        }
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        restore_collections = backup_collections
+        if collection_need_to_restore == "all":
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+            }
+        else:
+            restore_collections = names_need_backup[:collection_need_to_restore]
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+                "collection_names": restore_collections,
+            }
+        t0 = time.time()
+        res = self.client.restore_backup(payload)
+        restore_id = res["data"]["id"]
+        log.info(f"restore_backup: {res}")
+        if is_async:
+            res = self.client.wait_restore_complete(restore_id)
+            assert res is True
+        t1 = time.time()
+        log.info(f"restore {restore_collections} cost time: {t1 - t0}")
+        res, _ = self.utility_wrap.list_collections()
+        for name in restore_collections:
+            assert name + suffix in res
+        for name in restore_collections:
+            self.compare_collections(name, name + suffix)
+
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_back_with_db_support(self):
+        # prepare data
+        self._connect()
+        names_origin = []
+        for i in range(2):
+            db_name = cf.gen_unique_str("db")
+            db.create_database(db_name)
+            db.using_database(db_name)
+            collection_name = cf.gen_unique_str(prefix)
+            self.prepare_data(
+                name=collection_name,
+                db_name=db_name,
+                nb=3000,
+                is_binary=False,
+                auto_id=True,
+                check_function=False,
+            )
+            assert collection_name in self.utility_wrap.list_collections()[0]
+            names_origin.append(f"{db_name}.{collection_name}")
+        log.info(f"name_origin:{names_origin}")
+        # create backup
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": names_origin,
+        }
+        log.info(f"payload: {payload}")
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            # "collection_names": names_origin,
+            "collection_suffix": suffix,
+        }
+        log.info(f"restore payload: {payload}")
+        res = self.client.restore_backup(payload)
+        log.info(f"restore_backup: {res}")
+        for name in names_origin:
+            db_name = name.split(".")[0]
+            collection_name = name.split(".")[1]
+            db.using_database(db_name)
+
+            res, _ = self.utility_wrap.list_collections()
+            log.info(f"collection list in db {db_name}: {res}")
+            assert collection_name + suffix in res
+            self.compare_collections(collection_name, collection_name + suffix)
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.parametrize("include_json", [True])
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_back_with_new_dynamic_schema_and_partition_key(self, include_json, include_dynamic, include_partition_key):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        if include_json:
+            fields = [
+                cf.gen_int64_field(name="int64", is_primary=True),
+                cf.gen_int64_field(name="key"),
+                cf.gen_json_field(name="json"),
+                cf.gen_float_vec_field(name="float_vector", dim=128),
+            ]
+        else:
+            fields = [
+                cf.gen_int64_field(name="int64", is_primary=True),
+                cf.gen_int64_field(name="key"),
+                cf.gen_float_vec_field(name="float_vector", dim=128),
+            ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        # Use row-based data: list of dicts, each dict is a row
+        if include_json:
+            data = [
+                {
+                    "int64": i,  # int field
+                    "key": i % 3,  # int field
+                    "json": {f"key_{str(i)}": i},  # json field
+                    "float_vector": [np.float32(i) for _ in range(128)],  # vector field
+                    "address": fake_en.address(),  # dynamic field
+                    "name": fake_en.name(),  # dynamic field
+                    f"key_{i}": i,  # dynamic field
+                }
+                for i in range(nb)
+            ]
+        else:
+            data = [
+                {
+                    "int64": i,  # int field
+                    "key": i % 3,  # int field
+                    "float_vector": [np.float32(i) for _ in range(128)],  # vector field
+                    "address": fake_en.address(),  # dynamic field
+                    "name": fake_en.name(),  # dynamic field
+                    f"key_{i}": i,  # dynamic field
+                }
+                for i in range(nb)
+            ]
+        collection_w.insert(data=data)
+
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        if not include_json:
+            output_fields = [ct.default_int64_field_name]
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.parametrize("include_json", [True])
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_milvus_restore_back_with_multi_json_datatype(
+        self, include_json, include_dynamic, include_partition_key
+    ):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        if include_json:
+            fields = [
+                cf.gen_int64_field(name="int64", is_primary=True),
+                cf.gen_int64_field(name="key"),
+                cf.gen_json_field(name="json"),
+                cf.gen_float_vec_field(name="float_vector", dim=128),
+            ]
+        else:
+            fields = [
+                cf.gen_int64_field(name="int64", is_primary=True),
+                cf.gen_int64_field(name="key"),
+                cf.gen_float_vec_field(name="float_vector", dim=128),
+            ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        json_value = [
+            1,
+            1.0,
+            "1",
+            [1, 2, 3],
+            ["1", "2", "3"],
+            [1, 2, "3"],
+            {"key": "value"},
+        ]
+        if include_json:
+            data = [
+                [i for i in range(nb)],
+                [i % 3 for i in range(nb)],
+                [json_value[i % len(json_value)] for i in range(nb)],
+                [[np.float32(i) for i in range(128)] for _ in range(nb)],
+            ]
+        else:
+            data = [
+                [i for i in range(nb)],
+                [i % 3 for i in range(nb)],
+                [[np.float32(i) for i in range(128)] for _ in range(nb)],
+            ]
+        collection_w.insert(data=data)
+
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        if not include_json:
+            output_fields = [ct.default_int64_field_name]
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("drop_db", [True])
+    @pytest.mark.parametrize("str_json", [True, False])
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_with_db_collections(self, drop_db, str_json):
+        # prepare data
+        self._connect()
+        names_origin = []
+        db_collections = defaultdict(list)
+        for i in range(2):
+            db_name = cf.gen_unique_str("db")
+            db.create_database(db_name)
+            db.using_database(db_name)
+            for j in range(2):
+                collection_name = cf.gen_unique_str(prefix)
+                self.prepare_data(
+                    name=collection_name,
+                    db_name=db_name,
+                    nb=3000,
+                    is_binary=False,
+                    auto_id=True,
+                )
+                assert collection_name in self.utility_wrap.list_collections()[0]
+                names_origin.append(f"{db_name}.{collection_name}")
+                db_collections[db_name].append(collection_name)
+        db_collections = dict(db_collections)
+        log.info(f"db_collections:{db_collections}")
+        log.info(f"name_origin:{names_origin}")
+        # create backup
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "db_collections": json.dumps(db_collections)
+            if str_json
+            else db_collections,
+        }
+        log.info(f"payload: {payload}")
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        if drop_db:
+            # delete db to check that restore can create db if not exist
+            for db_name in db_collections:
+                db.using_database(db_name)
+                all_collections = list_collections()
+                for c in all_collections:
+                    collection = Collection(name=c)
+                    collection.drop()
+                db.drop_database(db_name)
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "db_collections": db_collections,
+            "collection_suffix": suffix,
+        }
+        log.info(f"restore payload: {payload}")
+        res = self.client.restore_backup(payload)
+        log.info(f"restore_backup: {res}")
+        for name in names_origin:
+            db_name = name.split(".")[0]
+            collection_name = name.split(".")[1]
+            db.using_database(db_name)
+            res, _ = self.utility_wrap.list_collections()
+            log.info(f"collection list in db {db_name}: {res}")
+            assert collection_name + suffix in res
+            if not drop_db:
+                self.compare_collections(collection_name, collection_name + suffix)
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_milvus_restore_back_with_array_datatype(self, include_dynamic, include_partition_key):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+        ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        collection_w.insert(data=data)
+        if include_dynamic:
+            data = [
+                {
+                    "int64": i,
+                    "key": i % 3,
+                    "json": {f"key_{str(i)}": i},
+                    "var_array": [str(x) for x in range(10)],
+                    "int_array": [int(x) for x in range(10)],
+                    "float_vector": [np.float32(i) for i in range(128)],
+                    f"dynamic_{str(i)}": i,
+                }
+                for i in range(nb, nb * 2)
+            ]
+            collection_w.insert(data=data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_milvus_restore_back_with_multi_vector_datatype(self, include_dynamic, include_partition_key):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector_0", dim=128),
+            cf.gen_float_vec_field(name="float_vector_1", dim=128),
+            cf.gen_float_vec_field(name="float_vector_2", dim=128),
+        ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        collection_w.insert(data=data)
+        if include_dynamic:
+            data = [
+                {
+                    "int64": i,
+                    "key": i % 3,
+                    "json": {f"key_{str(i)}": i},
+                    "var_array": [str(x) for x in range(10)],
+                    "int_array": [int(x) for x in range(10)],
+                    "float_vector_0": [np.float32(i) for i in range(128)],
+                    "float_vector_1": [np.float32(i) for i in range(128)],
+                    "float_vector_2": [np.float32(i) for i in range(128)],
+                    f"dynamic_{str(i)}": i,
+                }
+                for i in range(nb, nb * 2)
+            ]
+            collection_w.insert(data=data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_restore_back_with_f16_bf16_datatype(self, include_dynamic, include_partition_key):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_float16_vec_field(name="float16_vector", dim=128),
+            cf.gen_brain_float16_vec_field(name="brain_float16_vector", dim=128),
+        ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+            [
+                np.array([random.random() for _ in range(128)], dtype=np.float16)
+                for _ in range(nb)
+            ],
+            [
+                np.array([random.random() for _ in range(128)], dtype=ml_dtypes.bfloat16)
+                for _ in range(nb)
+            ],
+        ]
+        collection_w.insert(data=data)
+        if include_dynamic:
+            data = [
+                {
+                    "int64": i,
+                    "key": i % 3,
+                    "json": {f"key_{str(i)}": i},
+                    "var_array": [str(x) for x in range(10)],
+                    "int_array": [int(x) for x in range(10)],
+                    "float_vector": [np.float32(i) for i in range(128)],
+                    "float16_vector": np.array(
+                        [random.random() for _ in range(128)], dtype=np.float16
+                    ),
+                    "brain_float16_vector": np.array(
+                        [random.random() for _ in range(128)], dtype=ml_dtypes.bfloat16
+                    ),
+                    f"dynamic_{str(i)}": i,
+                }
+                for i in range(nb, nb * 2)
+            ]
+            collection_w.insert(data=data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.parametrize("enable_text_match", [True])
+    @pytest.mark.parametrize("enable_full_text_search", [True])
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    def test_milvus_restore_back_with_sparse_vector_text_match_datatype(self, include_dynamic, include_partition_key, enable_text_match, enable_full_text_search):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [cf.gen_int64_field(name="int64", is_primary=True),
+                  cf.gen_int64_field(name="key"),
+                  cf.gen_string_field(name="text", enable_match=enable_text_match, enable_analyzer=True),
+                  cf.gen_json_field(name="json"),
+                  cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+                  cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+                  cf.gen_float_vec_field(name="float_vector", dim=128),
+                  cf.gen_sparse_vec_field(name="sparse_vector"),
+                  # cf.gen_sparse_vec_field(name="bm25_sparse_vector"),
+                  ]
+        if enable_full_text_search:
+            fields.append(cf.gen_sparse_vec_field(name="bm25_sparse_vector"))
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+        if enable_full_text_search:
+            bm25_function = Function(
+                name="text_bm25_emb",
+                function_type=FunctionType.BM25,
+                input_field_names=["text"],
+                output_field_names=["bm25_sparse_vector"],
+                params={},
+            )
+            default_schema.add_function(bm25_function)
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        rng = np.random.default_rng()
+
+        data = []
+        for i in range(nb):
+            tmp = {
+                "int64": i,
+                "key": i % 3,
+                "text": fake_en.text(),
+                "json": {f"key_{str(i)}": i},
+                "var_array": [str(x) for x in range(10)],
+                "int_array": [int(x) for x in range(10)],
+                "float_vector": [np.float32(i) for i in range(128)],
+                "sparse_vector": {
+                    d: rng.random() for d in random.sample(range(1000), random.randint(20, 30))
+                },
+            }
+            if include_dynamic:
+                tmp[f"dynamic_{str(i)}"] = i
+            data.append(tmp)
+        texts = [d["text"] for d in data]
+        collection_w.insert(data=data)
+        res = self.client.create_backup({"async": False, "backup_name": back_up_name, "collection_names": [name_origin]})
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        # check text match and full text search in restored collection
+        word_freq = analyze_documents(texts)
+        token = word_freq.most_common(1)[0][0]
+        c = Collection(name=name_origin + suffix)
+        create_index_for_vector_fields(c)
+        c.load(timeout=600)
+        if enable_text_match:
+            res = c.query(
+                expr=f"text_match(text, '{token}')",
+                output_fields=["text"],
+                limit=1
+            )
+            assert len(res) == 1
+            for r in res:
+                assert token.lower() in r["text"].lower()
+        if enable_full_text_search:
+            search_data = [fake_en.text()+f" {token} "]
+            res = c.search(
+                data=search_data,
+                anns_field="bm25_sparse_vector",
+                output_fields=["text"],
+                param={},
+                limit=1
+            )
+            assert len(res) == 1
+            for r in res:
+                assert len(r) == 1
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    def test_milvus_restore_back_with_delete(self, use_v2_restore):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_string_field(name="text", enable_match=True, enable_analyzer=True),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_sparse_vec_field(name="bm25_vector"),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add BM25 function
+        bm25_function = Function(
+            name="text_bm25_emb",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["bm25_vector"],
+            params={},
+        )
+        default_schema.add_function(bm25_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [fake_en.text() for _ in range(nb)],  # Text data for BM25
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        res, result = collection_w.insert(data=data)
+        collection_w.flush()
+        pk = res.primary_keys
+        # delete first 100 rows
+        delete_ids = pk[:100]
+        collection_w.delete(expr=f"int64 in {delete_ids}")
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "useV2Restore": use_v2_restore
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    def test_milvus_restore_back_with_upsert(self, use_v2_restore):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_string_field(name="text", enable_match=True, enable_analyzer=True),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_sparse_vec_field(name="bm25_vector"),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add BM25 function
+        bm25_function = Function(
+            name="text_bm25_emb",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["bm25_vector"],
+            params={},
+        )
+        default_schema.add_function(bm25_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        # create index for float_vector and bm25_sparse_vector
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [fake_en.text() for _ in range(nb)],  # Text data for BM25
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        res, result = collection_w.insert(data=data)
+        collection_w.flush()
+        # upsert first 100 rows by pk
+        upsert_data = [
+            [i for i in range(100)],
+            [i % 3 for i in range(100, 200)],
+            [{f"key_{str(i)}": i} for i in range(100, 200)],
+            [fake_en.text() for _ in range(100)],  # Text data for BM25
+            [[str(x) for x in range(10, 20)] for _ in range(100)],
+            [[int(x) for x in range(10)] for _ in range(100)],
+            [[np.float32(i) for i in range(128, 128 * 2)] for _ in range(100)],
+        ]
+        res, result = collection_w.upsert(data=upsert_data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "useV2Restore": use_v2_restore
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_restore_back_with_dup_pk(self):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_string_field(name="text", enable_match=True, enable_analyzer=True),
+            cf.gen_array_field(name="var_array", element_type=DataType.VARCHAR),
+            cf.gen_array_field(name="int_array", element_type=DataType.INT64),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_sparse_vec_field(name="bm25_sparse_vector"),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add BM25 function
+        bm25_function = Function(
+            name="text_bm25_emb",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["bm25_sparse_vector"],
+            params={},
+        )
+        default_schema.add_function(bm25_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            [fake_en.text() for _ in range(nb)],  # Text data for BM25
+            [[str(x) for x in range(10)] for i in range(nb)],
+            [[int(x) for x in range(10)] for i in range(nb)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        res, result = collection_w.insert(data=data)
+        collection_w.flush()
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb, nb * 2)],
+            [{f"key_{str(i)}": i} for i in range(nb, nb * 2)],
+            [fake_en.text() for _ in range(nb, nb * 2)],  # Text data for BM25
+            [[str(x) for x in range(10)] for i in range(nb, nb * 2)],
+            [[int(x) for x in range(10)] for i in range(nb, nb * 2)],
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        res, result = collection_w.insert(data=data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    def test_milvus_restore_back_with_text_embedding(self, tei_endpoint):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        dim = 384
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_string_field(name="text"),
+            cf.gen_float_vec_field(name="dense", dim=dim),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+        text_embedding_function = Function(
+            name="tei",
+            function_type=FunctionType.TEXTEMBEDDING,
+            input_field_names=["text"],
+            output_field_names="dense",
+            params={
+                "provider": "TEI",
+                "endpoint": tei_endpoint,
+            },
+        )
+        default_schema.add_function(text_embedding_function)
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+            } for i in range(nb)
+        ]
+        batch_size = 100
+        for i in range(0, nb, batch_size):
+            collection_w.insert(data=data[i:i+batch_size])
+        collection_w.flush()
+        # delete first 100 rows
+        delete_ids = [i for i in range(100)]
+        collection_w.delete(expr=f"int64 in {delete_ids}")
+        # upsert last 100 rows by pk
+        upsert_data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+            } for i in range(nb-100, nb)
+        ]
+        collection_w.upsert(data=upsert_data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.parametrize("nb", [3000])
+    @pytest.mark.parametrize("is_auto_id", [True])
+    @pytest.mark.parametrize("enable_partition", [False])
+    @pytest.mark.parametrize("is_async", [True, False])
+    @pytest.mark.parametrize("collection_need_to_restore", [3])
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    @pytest.mark.parametrize("nullable", [True, False])
+    @pytest.mark.parametrize("is_all_data_type", [True])
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_restore_back_all_supported_data_type(
+        self,
+        use_v2_restore,
+        collection_need_to_restore,
+        is_async,
+        is_auto_id,
+        enable_partition,
+        nb,
+        nullable,
+        is_all_data_type
+    ):
+
+        # prepare data
+        names_origin = []
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        names_origin.append(cf.gen_unique_str(prefix))
+        self.prepare_data(
+            names_origin[-1],
+            nb=nb,
+            auto_id=is_auto_id,
+            check_function=False,
+            enable_partition=enable_partition,
+            nullable=nullable,
+            is_all_data_type = is_all_data_type
+            )
+        log.info(f"name_origin:{names_origin}, back_up_name: {back_up_name}")
+        for name in names_origin:
+            res, _ = self.utility_wrap.has_collection(name)
+            assert res is True
+        # create backup
+        names_need_backup = names_origin
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": names_need_backup,
+        }
+        res = self.client.create_backup(payload)
+        log.info(f"create backup response: {res}")
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        restore_collections = backup_collections
+        if collection_need_to_restore == "all":
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+            }
+        else:
+            restore_collections = names_need_backup[:collection_need_to_restore]
+            payload = {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_suffix": suffix,
+                "collection_names": restore_collections,
+            }
+        payload["useV2Restore"] = use_v2_restore
+        t0 = time.time()
+        res = self.client.restore_backup(payload)
+        restore_id = res["data"]["id"]
+        log.info(f"restore_backup: {res}")
+        if is_async:
+            res = self.client.wait_restore_complete(restore_id)
+            assert res is True
+        t1 = time.time()
+        log.info(f"restore {restore_collections} cost time: {t1 - t0}")
+        res, _ = self.utility_wrap.list_collections()
+        for name in restore_collections:
+            assert name + suffix in res
+        for name in restore_collections:
+            self.compare_collections(name, name + suffix, verify_by_query=True)
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    def test_milvus_restore_back_with_geometry_datatype(self, include_dynamic, include_partition_key):
+        """Test backup and restore with GEOMETRY data type"""
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_int64_field(name="key"),
+            cf.gen_json_field(name="json"),
+            cf.gen_geometry_field(name="geometry"),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+        ]
+        if include_partition_key:
+            partition_key = "key"
+            default_schema = cf.gen_collection_schema(
+                fields,
+                enable_dynamic_field=include_dynamic,
+                partition_key_field=partition_key,
+            )
+        else:
+            default_schema = cf.gen_collection_schema(
+                fields, enable_dynamic_field=include_dynamic
+            )
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        nb = 3000
+        # Generate WKT geometry data
+        geometry_data = cf.gen_wkt_geometry(nb, bounds=(0, 100, 0, 100))
+
+        data = [
+            [i for i in range(nb)],
+            [i % 3 for i in range(nb)],
+            [{f"key_{str(i)}": i} for i in range(nb)],
+            geometry_data,
+            [[np.float32(i) for i in range(128)] for _ in range(nb)],
+        ]
+        collection_w.insert(data=data)
+
+        if include_dynamic:
+            # Insert additional data with dynamic fields
+            data_with_dynamic = [
+                {
+                    "int64": i,
+                    "key": i % 3,
+                    "json": {f"key_{str(i)}": i},
+                    "geometry": geometry_data[i % len(geometry_data)],
+                    "float_vector": [np.float32(i) for i in range(128)],
+                    f"dynamic_{str(i)}": i,
+                }
+                for i in range(nb, nb * 2)
+            ]
+            collection_w.insert(data=data_with_dynamic)
+
+        # create index for geometry field
+        index_params = self.milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name="geometry",
+            index_name="geometry_index",
+            index_type="RTREE",
+        )
+        self.milvus_client.create_index(
+            collection_name=name_origin, index_params=index_params, timeout=600
+        )
+        log.info(f"Created index for {name_origin} geometry field")
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "restoreIndex": True,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        self.compare_indexes(name_origin, name_origin + suffix)
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.parametrize("include_partition_key", [True])
+    @pytest.mark.parametrize("include_dynamic", [True])
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    def test_milvus_restore_back_with_struct_array_datatype(self, include_dynamic, include_partition_key):
+        """Test backup and restore with struct array data type (multi-vector embeddings)"""
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+
+        # Configuration for multi-vector embeddings (similar to ColBERT)
+        DIM = 48
+        MAX_TOKENS = 100
+        AVG_TOKENS = 60
+        nb = 3000
+
+        # Create schema with struct array field for multi-vector embeddings
+        schema = self.milvus_client.create_schema(auto_id=False, enable_dynamic_field=include_dynamic)
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+
+        # Add partition key field if needed
+        if include_partition_key:
+            schema.add_field(field_name="key", datatype=DataType.INT64, is_partition_key=True)
+
+        # Add JSON field
+        schema.add_field(field_name="json", datatype=DataType.JSON)
+
+        # Create struct schema for multi-vector embeddings
+        struct_schema = self.milvus_client.create_struct_field_schema()
+        struct_schema.add_field("clip_embedding", DataType.FLOAT_VECTOR, dim=DIM)
+
+        # Add struct array field to main schema
+        schema.add_field(
+            "clips",
+            datatype=DataType.ARRAY,
+            element_type=DataType.STRUCT,
+            struct_schema=struct_schema,
+            max_capacity=MAX_TOKENS,
+        )
+
+        # Create collection
+        self.milvus_client.create_collection(collection_name=name_origin, schema=schema)
+
+        # Generate and insert data
+        data = []
+        empty_clips_ids = []  # Track IDs with empty clips for verification
+        for i in range(nb):
+            # 5% probability for empty clips array to test edge case
+            if random.random() < 0.05:
+                clips = []
+                empty_clips_ids.append(i)
+            else:
+                # Random number of tokens per document (normal distribution around avg)
+                num_tokens = int(np.random.normal(AVG_TOKENS, 15))
+                num_tokens = max(10, min(MAX_TOKENS, num_tokens))  # Clamp to [10, MAX_TOKENS]
+
+                # Generate random embeddings for this document
+                doc_embeddings = np.random.randn(num_tokens, DIM).astype(np.float32)
+
+                # Convert to list of structs format
+                clips = []
+                for j in range(num_tokens):
+                    clip_struct = {"clip_embedding": doc_embeddings[j].tolist()}
+                    clips.append(clip_struct)
+
+            row = {
+                "id": i,
+                "json": {f"key_{str(i)}": i},
+                "clips": clips
+            }
+
+            if include_partition_key:
+                row["key"] = i % 3
+
+            if include_dynamic:
+                row[f"dynamic_{str(i)}"] = i
+
+            data.append(row)
+
+        # Insert data in batches
+        batch_size = 500
+        for i in range(0, nb, batch_size):
+            self.milvus_client.insert(collection_name=name_origin, data=data[i:i+batch_size])
+
+        # Flush to ensure all data is persisted
+        self.milvus_client.flush(collection_name=name_origin, timeout=600)
+        log.info(f"Inserted {nb} rows, {len(empty_clips_ids)} rows have empty clips array")
+
+        # Create index for struct array vector field
+        index_params = self.milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name="clips[clip_embedding]",
+            index_name="clips_vector_index",
+            index_type="HNSW",
+            metric_type="MAX_SIM",
+            params={"M": 16, "efConstruction": 200}
+        )
+        self.milvus_client.create_index(
+            collection_name=name_origin, index_params=index_params, timeout=600
+        )
+        log.info(f"Created index for clips[clip_embedding] field")
+
+        # Create backup
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+
+        # Verify backup exists
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+
+        # Verify backup details
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+
+        # Restore backup
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "restoreIndex": True,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+
+        # Verify restored collection exists
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+
+        restored_name = name_origin + suffix
+
+        # Load collections to make them queryable
+        self.milvus_client.load_collection(collection_name=name_origin, timeout=600)
+        self.milvus_client.load_collection(collection_name=restored_name, timeout=600)
+        log.info(f"Loaded collections: {name_origin} and {restored_name}")
+
+        # Verify struct array data integrity by querying
+        original_result = self.milvus_client.query(
+            collection_name=name_origin,
+            filter="id >= 0",
+            output_fields=["id", "clips"],
+            limit=nb
+        )
+
+        restored_result = self.milvus_client.query(
+            collection_name=name_origin + suffix,
+            filter="id >= 0",
+            output_fields=["id", "clips"],
+            limit=nb
+        )
+
+        # Verify same number of results
+        assert len(original_result) == len(restored_result)
+
+        # Verify struct array content matches (including empty arrays)
+        restored_empty_count = 0
+        for orig, restored in zip(original_result, restored_result):
+            assert orig["id"] == restored["id"]
+            assert len(orig["clips"]) == len(restored["clips"])
+            # Track empty clips for verification
+            if len(restored["clips"]) == 0:
+                restored_empty_count += 1
+            for orig_clip, restored_clip in zip(orig["clips"], restored["clips"]):
+                assert len(orig_clip["clip_embedding"]) == len(restored_clip["clip_embedding"])
+                # Compare embeddings
+                orig_emb = np.array(orig_clip["clip_embedding"])
+                restored_emb = np.array(restored_clip["clip_embedding"])
+                np.testing.assert_array_almost_equal(orig_emb, restored_emb, decimal=5)
+
+        # Verify empty clips count matches
+        log.info(f"Verified {restored_empty_count} rows with empty clips array after restore")
+        assert restored_empty_count == len(empty_clips_ids), \
+            f"Empty clips count mismatch: expected {len(empty_clips_ids)}, got {restored_empty_count}"
+
+        # Clean up backup
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.tags(CaseLabel.L0)
+    def test_milvus_restore_backup_with_ttl_property(self):
+        """Verify that collection TTL property can be backed up and restored correctly"""
+
+        # 1. connect to Milvus
+        self._connect()
+
+        # 2. create a collection with TTL property via MilvusClient
+        collection_name = cf.gen_unique_str(prefix)
+        backup_name = cf.gen_unique_str(backup_prefix)
+        ttl_seconds = 1209600  # 14 days
+
+        dim = 8
+        schema = self.milvus_client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+        schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=dim)
+
+        # create collection with ttl property
+        self.milvus_client.create_collection(
+            collection_name=collection_name,
+            schema=schema,
+            properties={"collection.ttl.seconds": ttl_seconds},
+        )
+
+        # confirm collection exists and property set
+        col_info = self.milvus_client.describe_collection(collection_name=collection_name)
+        assert (
+            col_info.get("properties", {}).get("collection.ttl.seconds") == str(ttl_seconds)
+        )
+
+        # 3. create backup for the collection
+        create_payload = {
+            "async": False,
+            "backup_name": backup_name,
+            "collection_names": [collection_name],
+        }
+        res = self.client.create_backup(create_payload)
+        log.info(f"create_backup response: {res}")
+        assert res.get("msg", "") == "success"
+
+        # 4. restore backup with suffix
+        restore_payload = {
+            "async": False,
+            "backup_name": backup_name,
+            "collection_names": [collection_name],
+            "collection_suffix": suffix,
+        }
+        res = self.client.restore_backup(restore_payload)
+        log.info(f"restore_backup response: {res}")
+        assert res.get("msg", "") == "success"
+
+        # 5. verify restored collection exists and TTL property equals source
+        restored_name = collection_name + suffix
+        restored_info = self.milvus_client.describe_collection(collection_name=restored_name)
+        assert (
+            restored_info.get("properties", {}).get("collection.ttl.seconds")
+            == str(ttl_seconds)
+        )
+
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    @pytest.mark.parametrize("with_default_value", [True, False])
+    def test_milvus_restore_backup_with_add_field(self, with_default_value):
+        """
+        Test backup/restore with dynamically added fields.
+
+        Steps:
+        1. Create collection with base schema
+        2. Insert initial data
+        3. Add multiple fields of different types (INT64, VARCHAR, FLOAT, BOOL, JSON)
+        4. Insert more data with the new fields populated
+        5. Create backup
+        6. Restore backup
+        7. Verify schema includes all added fields and data integrity
+        """
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        nb_initial = 1000
+        nb_after = 500
+        dim = 128
+
+        # Step 1: Create collection with base schema
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_float_field(name="float", nullable=True),
+            cf.gen_string_field(name="varchar", nullable=True),
+            cf.gen_json_field(name="json", nullable=True),
+            cf.gen_float_vec_field(name="float_vector", dim=dim),
+        ]
+        default_schema = cf.gen_collection_schema(fields, enable_dynamic_field=True)
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+
+        # Step 2: Insert initial data
+        initial_data = [
+            [i for i in range(nb_initial)],  # int64
+            [float(i) for i in range(nb_initial)],  # float
+            [str(i) for i in range(nb_initial)],  # varchar
+            [{"key": i} for i in range(nb_initial)],  # json
+            [[np.float32(x) for x in range(dim)] for _ in range(nb_initial)],  # float_vector
+        ]
+        collection_w.insert(data=initial_data)
+        collection_w.flush()
+        log.info(f"Inserted {nb_initial} initial rows")
+
+        # Step 3: Add multiple fields of different types
+        # Define fields to add: (field_name, data_type, extra_kwargs)
+        # Note: FLOAT type default_value has type mismatch issue, use DOUBLE instead
+        fields_to_add = [
+            ("added_int64", DataType.INT64, {"nullable": True, "default_value": 0} if with_default_value else {"nullable": True}),
+            ("added_varchar", DataType.VARCHAR, {"nullable": True, "max_length": 256, "default_value": "default"} if with_default_value else {"nullable": True, "max_length": 256}),
+            ("added_double", DataType.DOUBLE, {"nullable": True, "default_value": 0.0} if with_default_value else {"nullable": True}),
+            ("added_bool", DataType.BOOL, {"nullable": True, "default_value": False} if with_default_value else {"nullable": True}),
+            ("added_json", DataType.JSON, {"nullable": True}),  # JSON does not support default_value
+        ]
+
+        added_field_names = []
+        for field_name, data_type, kwargs in fields_to_add:
+            self.milvus_client.add_collection_field(
+                collection_name=name_origin,
+                field_name=field_name,
+                data_type=data_type,
+                **kwargs
+            )
+            added_field_names.append(field_name)
+            log.info(f"Added field '{field_name}' with type {data_type.name}")
+
+        # Verify all fields were added to source collection
+        src_info = self.milvus_client.describe_collection(collection_name=name_origin)
+        src_field_names = [f["name"] for f in src_info["fields"]]
+        for field_name in added_field_names:
+            assert field_name in src_field_names, f"Field {field_name} not found in source collection"
+        log.info(f"All {len(added_field_names)} fields added successfully")
+        schema_info = self.milvus_client.describe_collection(collection_name=name_origin)
+        log.info(f"schema_info: {schema_info}")
+
+        # Step 4: Insert more data with the new fields populated
+        new_data = []
+        for i in range(nb_initial, nb_initial + nb_after):
+            row = {
+                "int64": i,
+                "float": float(i),
+                "varchar": str(i),
+                "json": {"key": i},
+                "float_vector": [np.float32(x) for x in range(dim)],
+                # New fields with values
+                "added_int64": i * 10,
+                "added_varchar": f"value_{i}",
+                "added_double": float(i) * 1.5,
+                "added_bool": i % 2 == 0,
+                "added_json": {"added_key": i, "nested": {"value": i * 2}},
+            }
+            new_data.append(row)
+        df = pd.DataFrame(new_data)
+        log.info(f"df: \n{df}")
+        # Use MilvusClient instead of ORM to ensure schema cache is updated
+        self.milvus_client.insert(collection_name=name_origin, data=new_data)
+        self.milvus_client.flush(collection_name=name_origin, timeout=600)
+        log.info(f"Inserted {nb_after} rows with new fields populated")
+
+        # Step 5: Create backup
+        res = self.client.create_backup({
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": [name_origin],
+        })
+        log.info(f"create_backup response: {res}")
+        assert res.get("msg", "") == "success", f"Backup creation failed: {res}"
+
+        # Verify backup was created
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            b["collection_name"] for b in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+
+        # Step 6: Restore backup
+        res = self.client.restore_backup({
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": [name_origin],
+            "collection_suffix": suffix,
+            "useV2Restore": True,
+        })
+        log.info(f"restore_backup response: {res}")
+        assert res.get("msg", "") == "success", f"Restore failed: {res}"
+
+        # Step 7: Verify restored collection
+        restored_name = name_origin + suffix
+        res, _ = self.utility_wrap.list_collections()
+        assert restored_name in res, f"Restored collection {restored_name} not found"
+
+        # Verify schema includes all added fields
+        restored_info = self.milvus_client.describe_collection(collection_name=restored_name)
+        restored_field_names = [f["name"] for f in restored_info["fields"]]
+        for field_name in added_field_names:
+            assert field_name in restored_field_names, \
+                f"Added field {field_name} not found in restored collection. Fields: {restored_field_names}"
+
+        # Verify data integrity using compare_collections
+        self.compare_collections(
+            name_origin,
+            restored_name,
+            verify_by_query=True,
+        )
+        log.info(f"Test passed: with_default_value={with_default_value}, added_fields={added_field_names}")
+
+    @pytest.mark.tags(CaseLabel.RELEASE)
+    def test_milvus_restore_backup_with_alter_enable_dynamic_schema(self):
+        """
+        Test backup/restore when dynamic schema is enabled via alter_collection_properties.
+
+        Steps:
+        1. Create collection with enable_dynamic_field=False using MilvusClient
+        2. Insert initial data (static fields only)
+        3. Alter collection to enable dynamic schema via alter_collection_properties
+        4. Insert more data with additional dynamic fields
+        5. Create backup
+        6. Restore backup
+        7. Verify schema has dynamic field enabled and data integrity
+        """
+        # Connect
+        self._connect()
+        collection_name = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        dim = 128
+        nb_initial = 1000
+        nb_after = 500
+
+        # Step 1: Create collection WITHOUT dynamic schema using MilvusClient
+        schema = self.milvus_client.create_schema(
+            auto_id=False,
+            enable_dynamic_field=False  # Start without dynamic schema
+        )
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("float_vector", DataType.FLOAT_VECTOR, dim=dim)
+        schema.add_field("varchar", DataType.VARCHAR, max_length=256, nullable=True)
+
+        self.milvus_client.create_collection(
+            collection_name=collection_name,
+            schema=schema,
+            consistency_level="Strong"  # Match ORM default for compare_collections
+        )
+        log.info(f"Created collection {collection_name} with enable_dynamic_field=False")
+
+        # Verify dynamic field is disabled
+        info = self.milvus_client.describe_collection(collection_name)
+        assert info.get("enable_dynamic_field", True) is False, \
+            f"Expected enable_dynamic_field=False, got {info}"
+
+        # Step 2: Insert initial data (static fields only)
+        initial_data = [
+            {
+                "id": i,
+                "float_vector": [np.float32(x) for x in range(dim)],
+                "varchar": f"initial_{i}",
+            }
+            for i in range(nb_initial)
+        ]
+        self.milvus_client.insert(collection_name, initial_data)
+        self.milvus_client.flush(collection_name, timeout=600)
+        log.info(f"Inserted {nb_initial} initial rows (static fields only)")
+
+        # Step 3: Alter collection to enable dynamic schema
+        # Reference: https://milvus.io/docs/modify-collection.md
+        self.milvus_client.alter_collection_properties(
+            collection_name,
+            properties={"dynamicfield.enabled": True}
+        )
+        log.info("Enabled dynamic schema via alter_collection_properties with dynamicfield.enabled=True")
+
+        # Verify dynamic field is now enabled
+        info = self.milvus_client.describe_collection(collection_name)
+        log.info(f"Collection info after alter: enable_dynamic_field={info.get('enable_dynamic_field')}, properties={info.get('properties')}")
+        assert info.get("enable_dynamic_field", False) is True, \
+            f"Expected enable_dynamic_field=True after alter, got {info}"
+
+        # Step 4: Insert data WITH dynamic fields
+        # After enabling dynamic field via properties, we should be able to insert dynamic fields
+        dynamic_data = [
+            {
+                "id": i,
+                "float_vector": [np.float32(x) for x in range(dim)],
+                "varchar": f"dynamic_{i}",
+                # Dynamic fields (not in schema)
+                "extra_string": f"extra_value_{i}",
+                "extra_int": i * 10,
+            }
+            for i in range(nb_initial, nb_initial + nb_after)
+        ]
+        self.milvus_client.insert(collection_name, dynamic_data)
+        self.milvus_client.flush(collection_name, timeout=600)
+        log.info(f"Inserted {nb_after} rows with dynamic fields")
+
+        # Step 5: Create backup
+        res = self.client.create_backup({
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": [collection_name],
+        })
+        log.info(f"create_backup response: {res}")
+        assert res.get("msg", "") == "success", f"Backup creation failed: {res}"
+
+        # Verify backup was created
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            b["collection_name"] for b in backup["data"]["collection_backups"]
+        ]
+        assert collection_name in backup_collections
+
+        # Step 6: Restore backup
+        res = self.client.restore_backup({
+            "async": False,
+            "backup_name": back_up_name,
+            "collection_names": [collection_name],
+            "collection_suffix": suffix,
+        })
+        log.info(f"restore_backup response: {res}")
+        assert res.get("msg", "") == "success", f"Restore failed: {res}"
+
+        # Step 7: Verify restored collection
+        restored_name = collection_name + suffix
+        res, _ = self.utility_wrap.list_collections()
+        assert restored_name in res, f"Restored collection {restored_name} not found"
+
+        # Verify dynamic field is enabled in restored collection
+        restored_info = self.milvus_client.describe_collection(restored_name)
+        log.info(f"Restored collection info: enable_dynamic_field={restored_info.get('enable_dynamic_field')}, properties={restored_info.get('properties')}")
+        assert restored_info.get("enable_dynamic_field", False) is True, \
+            f"Restored collection should have enable_dynamic_field=True, got {restored_info}"
+
+        # Verify data integrity using compare_collections
+        self.compare_collections(
+            collection_name,
+            restored_name,
+            verify_by_query=True,
+        )
+        log.info("Test passed: alter enable_dynamic_schema backup/restore verified")
+
+    @pytest.mark.tags(CaseLabel.MASTER)
+    def test_milvus_restore_back_with_minhash_function(self):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_string_field(name="text", max_length=65535),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_binary_vec_field(name="minhash_signature", dim=512),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add MinHash function
+        minhash_function = Function(
+            name="text_minhash",
+            function_type=FunctionType.MINHASH,
+            input_field_names=["text"],
+            output_field_names=["minhash_signature"],
+            params={"num_hashes": 16, "shingle_size": 3},
+        )
+        default_schema.add_function(minhash_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        # The shared create_index_for_vector_fields helper builds binary
+        # fields with BIN_IVF_FLAT/JACCARD, which cannot serve the mandatory
+        # MHJACCARD search on a MinHash function output field. Build the
+        # indexes explicitly so the backup — and any snapshot-restored copy
+        # of it — carries a searchable index.
+        collection_w.create_index(
+            "float_vector",
+            {"index_type": "HNSW", "metric_type": "L2", "params": {"M": 48, "efConstruction": 500}},
+        )
+        collection_w.create_index(
+            "minhash_signature",
+            {"index_type": "MINHASH_LSH", "metric_type": "MHJACCARD", "params": {}},
+        )
+        nb = 3000
+        data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+                "float_vector": [np.float32(i) for i in range(128)],
+            } for i in range(nb)
+        ]
+        collection_w.insert(data=data)
+        collection_w.flush()
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin, name_origin + suffix, output_fields=output_fields
+        )
+        # Verify MinHash search works on restored collection
+        c = Collection(name=name_origin + suffix)
+        if backup["data"].get("format") == "snapshot":
+            # Snapshot restore brings the source's own indexes back, which
+            # are already MHJACCARD here and searchable directly. Master
+            # allows at most one distinct index per field, so recreating
+            # them would be rejected.
+            pass
+        else:
+            # Binlog restore carries no indexes, recreate them as on 2.6.
+            c.create_index(
+                "float_vector",
+                {"index_type": "FLAT", "metric_type": "L2", "params": {}},
+                timeout=600,
+            )
+            c.create_index(
+                "minhash_signature",
+                {"index_type": "MINHASH_LSH", "metric_type": "MHJACCARD", "params": {}},
+                timeout=600,
+            )
+        c.load(timeout=600)
+        res = c.search(
+            data=[data[0]["text"]],
+            anns_field="minhash_signature",
+            output_fields=["text"],
+            param={"metric_type": "MHJACCARD"},
+            limit=1,
+        )
+        assert len(res) == 1
+        assert len(res[0]) == 1
+        res = self.client.delete_backup(back_up_name)
+        res = self.client.list_backup()
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name not in all_backup
+
+    @pytest.mark.tags(CaseLabel.MASTER)
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    def test_milvus_restore_back_with_minhash_function_and_delete(self, use_v2_restore):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_string_field(name="text", max_length=65535),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_binary_vec_field(name="minhash_signature", dim=512),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add MinHash function
+        minhash_function = Function(
+            name="text_minhash",
+            function_type=FunctionType.MINHASH,
+            input_field_names=["text"],
+            output_field_names=["minhash_signature"],
+            params={"num_hashes": 16, "shingle_size": 3},
+        )
+        default_schema.add_function(minhash_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+                "float_vector": [np.float32(i) for i in range(128)],
+            } for i in range(nb)
+        ]
+        res, result = collection_w.insert(data=data)
+        collection_w.flush()
+        pk = res.primary_keys
+        # delete first 100 rows
+        delete_ids = pk[:100]
+        collection_w.delete(expr=f"int64 in {delete_ids}")
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "useV2Restore": use_v2_restore,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.tags(CaseLabel.MASTER)
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    def test_milvus_restore_back_with_minhash_function_and_upsert(self, use_v2_restore):
+        self._connect()
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        fields = [
+            cf.gen_int64_field(name="int64", is_primary=True),
+            cf.gen_string_field(name="text", max_length=65535),
+            cf.gen_float_vec_field(name="float_vector", dim=128),
+            cf.gen_binary_vec_field(name="minhash_signature", dim=512),
+        ]
+        default_schema = cf.gen_collection_schema(fields)
+
+        # Add MinHash function
+        minhash_function = Function(
+            name="text_minhash",
+            function_type=FunctionType.MINHASH,
+            input_field_names=["text"],
+            output_field_names=["minhash_signature"],
+            params={"num_hashes": 16, "shingle_size": 3},
+        )
+        default_schema.add_function(minhash_function)
+
+        collection_w = self.init_collection_wrap(
+            name=name_origin, schema=default_schema, active_trace=True
+        )
+        create_index_for_vector_fields(collection_w)
+        nb = 3000
+        data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+                "float_vector": [np.float32(i) for i in range(128)],
+            } for i in range(nb)
+        ]
+        res, result = collection_w.insert(data=data)
+        collection_w.flush()
+        # upsert first 100 rows by pk
+        upsert_data = [
+            {
+                "int64": i,
+                "text": fake_en.text(),
+                "float_vector": [np.float32(i) for i in range(128, 128 * 2)],
+            } for i in range(100)
+        ]
+        res, result = collection_w.upsert(data=upsert_data)
+        res = self.client.create_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+            }
+        )
+        log.info(f"create_backup {res}")
+        res = self.client.list_backup()
+        log.info(f"list_backup {res}")
+        if "data" in res:
+            all_backup = [r["name"] for r in res["data"]]
+        else:
+            all_backup = []
+        assert back_up_name in all_backup
+        backup = self.client.get_backup(back_up_name)
+        assert backup["data"]["name"] == back_up_name
+        backup_collections = [
+            backup["collection_name"] for backup in backup["data"]["collection_backups"]
+        ]
+        assert name_origin in backup_collections
+        res = self.client.restore_backup(
+            {
+                "async": False,
+                "backup_name": back_up_name,
+                "collection_names": [name_origin],
+                "collection_suffix": suffix,
+                "useV2Restore": use_v2_restore,
+            }
+        )
+        log.info(f"restore_backup: {res}")
+        res, _ = self.utility_wrap.list_collections()
+        assert name_origin + suffix in res
+        output_fields = None
+        self.compare_collections(
+            name_origin,
+            name_origin + suffix,
+            output_fields=output_fields,
+            verify_by_query=True,
+        )
+
+    @pytest.mark.parametrize("nb", [3000])
+    @pytest.mark.parametrize("use_v2_restore", [True, False])
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_milvus_restore_with_collection_override(self, nb, use_v2_restore):
+        """Test restore with per-collection shard_num and description override via restorePlan"""
+        # prepare data
+        name_origin = cf.gen_unique_str(prefix)
+        back_up_name = cf.gen_unique_str(backup_prefix)
+        self.prepare_data(name_origin, nb=nb, is_binary=False, auto_id=True)
+        collection_src = Collection(name=name_origin)
+        src_shard_num = collection_src.num_shards
+        src_description = collection_src.description
+        log.info(f"source collection shard_num: {src_shard_num}, description: {src_description}")
+
+        # create backup
+        res = self.client.create_backup(
+            {"async": False, "backup_name": back_up_name, "collection_names": [name_origin]}
+        )
+        log.info(f"create backup response: {res}")
+        # shard_num override is rejected for snapshot format backups (the
+        # collection is restored by Milvus from the snapshot bundle, so its
+        # shard layout cannot change). Run this case on binlog backups only.
+        backup = self.client.get_backup(back_up_name)
+        if backup["data"].get("format") == "snapshot":
+            pytest.skip("shard_num override is not supported with snapshot format backups")
+
+        # restore with restorePlan containing override
+        target_shard_num = 1
+        target_description = "overridden_description_for_test"
+        target_name = name_origin + suffix
+        payload = {
+            "async": False,
+            "backup_name": back_up_name,
+            "useV2Restore": use_v2_restore,
+            "restorePlan": {
+                "mapping": [
+                    {
+                        "source": "default",
+                        "target": "default",
+                        "colls": [
+                            {
+                                "source": name_origin,
+                                "target": target_name,
+                                "override": {
+                                    "shardNum": target_shard_num,
+                                    "description": target_description,
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "filter": {
+                    "default": {"colls": [target_name]},
+                },
+            },
+        }
+        res = self.client.restore_backup(payload)
+        log.info(f"restore_backup: {res}")
+        assert res["msg"] == "success"
+
+        # verify restored collection exists
+        res, _ = self.utility_wrap.list_collections()
+        assert target_name in res
+
+        # verify shard_num and description overrides
+        collection_dist = Collection(name=target_name)
+        log.info(f"restored collection shard_num: {collection_dist.num_shards}, description: {collection_dist.description}")
+        assert collection_dist.num_shards == target_shard_num, (
+            f"expected shard_num={target_shard_num}, got {collection_dist.num_shards}"
+        )
+        assert collection_dist.description == target_description, (
+            f"expected description={target_description}, got {collection_dist.description}"
+        )
+
+        # verify data integrity (skip compare_collections which asserts schema equality)
+        collection_src = Collection(name=name_origin)
+        collection_dist = Collection(name=target_name)
+        assert collection_src.num_entities == collection_dist.num_entities, (
+            f"entity count mismatch: src={collection_src.num_entities}, dist={collection_dist.num_entities}"
+        )

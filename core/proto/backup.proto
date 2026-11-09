@@ -1,0 +1,420 @@
+syntax = "proto3";
+package milvus.proto.backup;
+
+option go_package="github.com/zilliztech/milvus-backup/core/proto/backuppb";
+
+enum ResponseCode {
+  Success = 0;
+  Not_Support = 1;
+  No_Permission = 2;
+  Fail = 3;
+  Parameter_Error = 400;
+  Request_Object_Not_Found = 404;
+  // Storage preflight failed before task registration. The caller may retry create.
+  Storage_Not_Ready = 503;
+}
+
+message IndexInfo {
+  string field_name = 1;
+  string index_name = 2;
+  string index_type = 3;
+  map<string, string> params = 4;
+  int64 index_id = 5;
+
+  // extra info from etcd
+  int64 field_id = 6;
+  uint64 create_time = 7;
+  repeated KeyValuePair type_params = 8;
+  repeated KeyValuePair index_params = 9;
+  repeated KeyValuePair user_index_params = 10;
+  bool is_auto_index = 11;
+  int32 min_index_version = 12;
+  int32 max_index_version = 13;
+}
+
+message DatabaseBackupInfo {
+  string db_name = 1;
+  int64 db_id = 2;
+  repeated KeyValuePair properties = 3;
+  string ezk = 4;
+}
+
+/**
+ * Where a collection's exported snapshot bundle lives.
+ */
+message SnapshotBackupInfo {
+  // Relative to the backup directory, e.g. snapshots/449577/metadata/449580.json,
+  // so that moving the backup to another bucket or prefix keeps it restorable.
+  string metadata_path = 1;
+  // As reported by the export job that wrote the bundle. total_bytes covers index
+  // files, so it is not comparable with the size the binlog format records.
+  int64 total_files = 2;
+  int64 total_bytes = 3;
+}
+
+message CollectionBackupInfo {
+  string id = 1;
+  // BackupTaskStateCode state_code = 2 [deprecated=true];
+  // string errorMessage = 3 [deprecated=true];
+  // int64 start_time = 4 [deprecated=true];
+  // int64 end_time = 5 [deprecated=true];
+  // int32 progress = 6 [deprecated=true];
+  int64 collection_id = 7;
+  string db_name = 8;
+  string collection_name = 9;
+  CollectionSchema schema = 10;
+  int32 shards_num = 11;
+  ConsistencyLevel consistency_level = 12;
+  repeated PartitionBackupInfo partition_backups = 13;
+  // logical time of backup, used for restore
+  uint64 backup_timestamp = 14;
+  int64 size = 15;
+  bool has_index = 16;
+  repeated IndexInfo index_infos = 17;
+  string load_state = 18;
+  // physical unix time of backup 
+  uint64 backup_physical_timestamp = 19;
+  map<string, string> channel_checkpoints = 20;
+  repeated SegmentBackupInfo l0_segments = 21;
+  repeated KeyValuePair properties = 22;
+  int64 db_id = 23;
+  uint64 created_timestamp = 24;
+  repeated string virtual_channel_names = 25;
+  repeated string physical_channel_names = 26;
+  repeated string aliases = 28;
+  // set only in the snapshot format
+  SnapshotBackupInfo snapshot_backup = 29;
+}
+
+message PartitionBackupInfo {
+  int64 partition_id = 1;
+  string partition_name = 2;
+  int64 collection_id = 3;
+  // array of segment backup
+  repeated SegmentBackupInfo segment_backups = 4;
+  int64 size = 5;
+  string load_state = 6;
+}
+
+/**
+ * lite version of datapb.SegmentInfo
+ */
+message SegmentBackupInfo {
+  int64 segment_id = 1;
+  int64 collection_id = 2;
+  int64 partition_id = 3;
+  int64 num_of_rows = 4;
+  repeated FieldBinlog binlogs = 5;
+  repeated FieldBinlog statslogs = 6 [deprecated=true];
+  repeated FieldBinlog deltalogs = 7;
+  int64 size = 8;
+  // The group ID is a virtual partition ID.
+  // The Milvus BulkInsert interface requires a partition prefix,
+  // but passing multiple segments is a more suitable option.
+  // Therefore, a virtual partition ID is used here to enable the functionality of importing multiple segments.
+  int64 group_id = 9;
+  bool backuped = 10 [deprecated=true];
+  bool is_l0 = 11;
+  string v_channel = 12;
+  int64 storage_version = 13;
+}
+
+/**
+ * root of backup
+ */
+message BackupInfo {
+  string id = 1;
+  BackupTaskStateCode state_code = 2 [deprecated=true];
+  // string errorMessage = 3 [deprecated=true];
+  // int64 start_time = 4 [deprecated=true];
+  // int64 end_time = 5 [deprecated=true];
+  // int32 progress = 6 [deprecated=true];
+  string name = 7;
+  // backup timestamp
+  uint64 backup_timestamp = 8;
+  // array of collection backup
+  repeated CollectionBackupInfo collection_backups = 9;
+  int64 size = 10;
+  string milvus_version = 11;
+  RBACMeta rbac_meta = 12;
+  RPCChannelInfo rpc_channel_info = 13;
+  repeated DatabaseBackupInfo database_backups = 14;
+  map<string, string> flush_all_msgs_base64 = 15; // key is pchannel, value is base64 encoded ImmutableMessage
+  string control_channel_name = 16;
+  repeated string physical_channel_names = 17;
+  // Which format the backup was written in: empty for the binlog format, "snapshot"
+  // for exported snapshot bundles. A string rather than an enum because this meta is
+  // stored as plain json, where an enum would land as a bare integer.
+  string format = 18;
+}
+
+message RPCChannelInfo {
+  string name = 1;
+  string position = 2;
+}
+
+/**
+ * For level storage
+ */
+message CollectionLevelBackupInfo {
+  repeated CollectionBackupInfo infos = 1;
+}
+
+/**
+ * For level storage
+ */
+message PartitionLevelBackupInfo {
+  repeated PartitionBackupInfo infos = 1;
+}
+
+/**
+ * For level storage
+ */
+message SegmentLevelBackupInfo {
+  repeated SegmentBackupInfo infos = 1;
+}
+
+/**
+ * Create Backup in milvus
+ */
+enum BackupTaskStateCode {
+  BACKUP_INITIAL = 0;  // pending
+  BACKUP_EXECUTING = 1;
+  BACKUP_SUCCESS = 2;
+  BACKUP_FAIL = 3;
+  BACKUP_TIMEOUT = 4;
+}
+
+enum RestoreTaskStateCode {
+  INITIAL = 0;
+  EXECUTING = 1;
+  SUCCESS = 2;
+  FAIL = 3;
+  TIMEOUT = 4;
+}
+
+// copied from milvus data_coord.proto
+message FieldBinlog{
+  int64 fieldID = 1;
+  repeated Binlog binlogs = 2;
+}
+
+message Binlog {
+  int64 entries_num = 1 [deprecated=true];
+  uint64 timestamp_from = 2 [deprecated=true];
+  uint64 timestamp_to = 3 [deprecated=true];
+  string log_path = 4;
+  int64 log_size = 5;
+  int64 log_id = 6;
+}
+
+// copied from milvus common.proto
+message KeyValuePair {
+  string key = 1;
+  string value = 2;
+}
+
+enum ConsistencyLevel {
+  Strong = 0;
+  Session = 1; // default in PyMilvus
+  Bounded = 2;
+  Eventually = 3;
+  Customized = 4; // Users pass their own `guarantee_timestamp`.
+}
+
+enum FunctionType{
+  Unknown =0;
+  BM25 =1;
+  TextEmbedding =2;
+}
+
+// copied from milvus schema.proto
+
+/**
+ * @brief Field data type
+ */
+enum DataType {
+  None = 0;
+  Bool = 1;
+  Int8 = 2;
+  Int16 = 3;
+  Int32 = 4;
+  Int64 = 5;
+
+  Float = 10;
+  Double = 11;
+
+  String = 20;
+  VarChar = 21; // variable-length strings with a specified maximum length
+  Array = 22;
+  JSON = 23;
+  Geometry = 24;
+  Text = 25;
+  Timestamptz = 26;
+
+  BinaryVector = 100;
+  FloatVector = 101;
+  Float16Vector = 102;
+  BFloat16Vector = 103;
+  SparseFloatVector = 104;
+  Int8Vector = 105;
+  ArrayOfVector = 106;
+
+  ArrayOfStruct = 200;  // internal types, not used in user interface
+  Struct = 201;
+}
+
+enum FieldState {
+  FieldCreated = 0;
+  FieldCreating = 1;
+  FieldDropping = 2;
+  FieldDropped = 3;
+}
+
+message ValueField {
+  oneof data {
+    bool bool_data = 1;
+    int32 int_data = 2;
+    int64 long_data = 3;
+    float float_data = 4;
+    double double_data = 5;
+    string string_data = 6;
+    bytes bytes_data = 7;
+  }
+}
+
+message FieldSchema {
+  int64 fieldID = 1;
+  string name = 2;
+  bool is_primary_key = 3;
+  string description = 4;
+  DataType data_type = 5;
+  repeated KeyValuePair type_params = 6;
+  repeated KeyValuePair index_params = 7;
+  bool autoID = 8;
+  FieldState state = 9; // To keep compatible with older version, the default state is `Created`.
+  DataType element_type = 10; // For array type, the element type is stored here
+  ValueField default_value = 11; // default_value only support scalars except array and json for now
+  bool is_dynamic = 12; // mark whether this field is the dynamic field
+  bool is_partition_key = 13; // enable logic partitions
+  bool nullable = 14;
+  string default_value_proto = 15 [deprecated=true]; // json not support marshall oneof, so use proto string
+  bool is_function_output = 16;
+  string default_value_base64 = 17;
+}
+
+message FunctionSchema {
+  string name = 1;
+  int64 id =2;
+  string description = 3;
+  FunctionType type = 4;
+  repeated string input_field_names = 5;
+  repeated int64 input_field_ids = 6;
+  repeated string output_field_names = 7;
+  repeated int64 output_field_ids = 8;
+  repeated KeyValuePair params = 9;
+}
+
+/**
+ * @brief Collection schema
+ */
+message CollectionSchema {
+  string name = 1;
+  string description = 2;
+  bool autoID = 3; // deprecated later, keep compatible with c++ part now
+  repeated FieldSchema fields = 4;
+  bool enable_dynamic_field = 5; // mark whether this table has the dynamic field function enabled.
+  repeated KeyValuePair properties = 6;
+  repeated FunctionSchema functions = 7;
+  repeated StructArrayFieldSchema struct_array_fields = 9;
+  // The source collection's schema version at backup time (schemapb.CollectionSchema.version).
+  // Server-assigned: 0 when the collection is created, +1 on every schema-update DDL.
+  // Recorded so a restored collection can be aligned with its source; a collection
+  // restored with a version lower than its source breaks CDC replay of inserts
+  // (STREAMING_CODE_SCHEMA_VERSION_MISMATCH). Field number mirrors the upstream proto.
+  int32 version = 10;
+}
+
+message StructArrayFieldSchema {
+  int64 fieldID = 1;
+  string name = 2;
+  string description = 3;
+  repeated FieldSchema fields = 4;
+  // nullable is a struct-level flag: the server propagates it to every
+  // sub-field, and sub-fields must not be nullable unless it is set.
+  bool nullable = 5;
+
+  // TODO: STRUCT type may also need to support Function in the future
+}
+
+message MsgPosition {
+  string channel_name = 1;
+  bytes msgID = 2;
+  string msgGroup = 3;
+  uint64 timestamp = 4;
+}
+
+message ChannelPosition {
+  string name = 1;
+  string position = 2;
+}
+
+message RoleEntity {
+  string name = 1;
+}
+
+message UserEntity {
+  string name = 1;
+}
+
+message ObjectEntity {
+  string name = 1;
+}
+
+message PrivilegeEntity {
+  string name = 1;
+}
+
+message GrantorEntity {
+  UserEntity user = 1;
+  PrivilegeEntity privilege = 2;
+}
+
+message GrantPrivilegeEntity {
+  repeated GrantorEntity entities = 1;
+}
+
+message GrantEntity {
+  // role
+  RoleEntity role = 1;
+  // object
+  ObjectEntity object = 2;
+  // object name
+  string object_name = 3;
+  // privilege
+  GrantorEntity grantor = 4;
+  // db name
+  string db_name = 5;
+}
+
+message PrivilegeGroupInfo {
+  string group_name = 1;
+  repeated PrivilegeEntity privileges = 2;
+}
+
+message UserInfo {
+  string user = 1;
+  string password = 2;
+  repeated RoleEntity roles = 3;
+}
+
+message RBACMeta {
+  // user
+  repeated UserInfo users = 1;
+  // role
+  repeated RoleEntity roles = 2;
+  // (role, object, previledge)
+  repeated GrantEntity grants = 3;
+  // privilege group
+  repeated PrivilegeGroupInfo privilege_groups = 4;
+}

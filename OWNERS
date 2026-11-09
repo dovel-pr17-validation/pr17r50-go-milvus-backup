@@ -1,0 +1,12 @@
+filters:
+  ".*":
+    reviewers:
+      - huanghaoyuanhhy
+      - zhuwenxing
+      - lentitude2tk
+      - alohaha22
+    approvers:
+      - huanghaoyuanhhy
+      - zhuwenxing
+      - lentitude2tk
+      - alohaha22

@@ -1,0 +1,37 @@
+package restore
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+)
+
+var _strategyMap = map[string]Strategy{
+	// "auto" spells out what the empty string already means: callers that
+	// always set the field, such as a request template shared by binlog and
+	// snapshot backups, can name the value explicitly.
+	"auto":         StrategyAuto,
+	"per_seg":      StrategyPerSeg,
+	"merged_seg":   StrategyMergedSeg,
+	"restore_snap": StrategyRestoreSnap,
+	"import_snap":  StrategyImportSnap,
+}
+
+func SupportStrategy() []string { return slices.Sorted(maps.Keys(_strategyMap)) }
+
+func ParseStrategy(strategy string) (Strategy, error) {
+	if strategy == "" {
+		return StrategyAuto, nil
+	}
+
+	if strategy == "snapshot" {
+		return StrategyAuto, errors.New(`restore: "snapshot" is a backup format, not a restore strategy; the format comes from the backup itself`)
+	}
+
+	if s, ok := _strategyMap[strategy]; ok {
+		return s, nil
+	}
+
+	return StrategyAuto, fmt.Errorf("restore: invalid strategy %s", strategy)
+}

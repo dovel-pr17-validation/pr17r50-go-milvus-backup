@@ -1,0 +1,22 @@
+{
+  "requestId": "rid-1",
+  "msg": "success",
+  "data": {
+    "id": "task-1",
+    "state_code": 2,
+    "start_time": 1,
+    "end_time": 2,
+    "progress": 100,
+    "collection_restore_tasks": [
+      {
+        "state_code": 2,
+        "start_time": 1,
+        "end_time": 2,
+        "progress": 100,
+        "target_db_name": "db1",
+        "target_collection_name": "coll1"
+      }
+    ]
+  }
+}
+

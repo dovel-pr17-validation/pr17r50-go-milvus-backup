@@ -1,0 +1,19 @@
+.idea/
+.vscode/
+milvus-backup
+**/volumes/*
+**/__pycache__/*
+**/.pytest_cache/*
+logs/
+examplebackup/
+
+dist/
+.DS_Store
+
+# Claude Code
+CLAUDE.local.md
+
+# AI coding agent state
+.claude/
+.codex/
+.zcode/

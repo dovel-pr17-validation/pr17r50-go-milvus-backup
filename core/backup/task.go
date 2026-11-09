@@ -1,0 +1,729 @@
+package backup
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/zilliztech/milvus-backup/core/tasklet"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/client/milvus"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+	"github.com/zilliztech/milvus-backup/internal/filter"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/meta"
+	"github.com/zilliztech/milvus-backup/internal/storage"
+	"github.com/zilliztech/milvus-backup/internal/storage/mpath"
+)
+
+const (
+	_rpcChWarnMessage = "Failed to back up RPC channel position. This won't cause the backup to fail, " +
+		"but may lead to inconsistency when reconnecting to CDC for incremental data replication."
+)
+
+type TaskArgs struct {
+	TaskID string
+
+	Option Option
+
+	MilvusStorage storage.Client
+
+	BackupStorage storage.Client
+	BackupDir     string
+
+	Params *cfg.Config
+
+	// Tracker is the job's handle on its own state in the job store. The job
+	// minted it at registration and hands it down; nothing in the tree goes
+	// through the store map again.
+	Tracker *jobstate.BackupTracker
+}
+
+type Option struct {
+	BackupName string
+
+	PauseGC    bool
+	ManageAddr string
+
+	Strategy Strategy
+	Format   Format
+
+	BackupRBAC bool
+
+	BackupIndexExtra bool
+
+	// DropSnapshotIfExists drops a same-name snapshot before the backup's own
+	// snapshot is created, clearing a leftover from an earlier run that died
+	// mid-flight; without it that leftover refuses the create. Snapshot format
+	// only.
+	DropSnapshotIfExists bool
+
+	// dbName -> CollFilter
+	Filter filter.Filter
+}
+
+type Task struct {
+	taskID string
+
+	logger *zap.Logger
+
+	option Option
+	params *cfg.Config
+
+	milvusStorage  storage.Client
+	milvusRootPath string
+
+	streaming bool
+
+	backupStorage storage.Client
+	backupDir     string
+
+	throttling concurrencyThrottling
+
+	grpc    milvus.Grpc
+	restful milvus.Restful
+	manage  milvus.Manage
+
+	etcdCli      *clientv3.Client
+	etcd         *etcdMeta
+	etcdRootPath string
+
+	metaBuilder *metaBuilder
+
+	gcCtrl gcCtrl
+
+	tracker *jobstate.BackupTracker
+
+	rpcChannelName string
+
+	// resolvedFormat is what the requested format resolved to against the server,
+	// and snapshotTarget where the snapshot format exports its bundles. Both are
+	// set in privateExecute before any collection work starts.
+	resolvedFormat string
+	snapshotTarget snapshotTarget
+}
+
+func newGCCtrl(taskID string, pauseGC bool, grpc milvus.Grpc, manage milvus.Manage) gcCtrl {
+	if !pauseGC {
+		return &emptyGCCtrl{}
+	}
+
+	if grpc.HasFeature(milvus.CollectionLevelGCControl) {
+		return newCollGCCtrl(taskID, manage)
+	}
+
+	return newClusterGCCtrl(taskID, manage)
+}
+
+// NewTask builds the backup run. Registration is not part of it: the job
+// registers at admission and hands the tracker in, so a task object that was
+// never registered cannot exist.
+func NewTask(args TaskArgs) *Task {
+	logger := log.L().With(zap.String("task_id", args.TaskID))
+
+	streaming := storage.UseStreaming(args.Params.Transfer.Mode.Val,
+		args.MilvusStorage.Config(), args.BackupStorage.Config())
+	logger.Info("resolved transfer mode",
+		zap.String("transfer_mode", args.Params.Transfer.Mode.Val),
+		zap.Bool("streaming", streaming))
+
+	mb := newMetaBuilder(args.TaskID, args.Option.BackupName)
+
+	throttling := concurrencyThrottling{
+		DDLSem:  semaphore.NewWeighted(int64(args.Params.Backup.Concurrency.Collections.Val)),
+		DMLSem:  semaphore.NewWeighted(int64(args.Params.Backup.Concurrency.Collections.Val)),
+		SegSem:  semaphore.NewWeighted(int64(args.Params.Backup.Concurrency.Segments.Val)),
+		CopySem: semaphore.NewWeighted(int64(args.Params.Transfer.Concurrency.Val)),
+	}
+
+	return &Task{
+		taskID: args.TaskID,
+
+		logger: logger,
+
+		option: args.Option,
+
+		params: args.Params,
+
+		milvusStorage:  args.MilvusStorage,
+		milvusRootPath: args.Params.Milvus.Storage.RootPath.Val,
+
+		streaming: streaming,
+
+		backupStorage: args.BackupStorage,
+		backupDir:     args.BackupDir,
+
+		throttling: throttling,
+
+		etcdRootPath: args.Params.Milvus.Etcd.RootPath.Val,
+
+		metaBuilder: mb,
+
+		tracker: args.Tracker,
+
+		rpcChannelName: args.Params.Milvus.Replicate.RPCChannelName.Val,
+	}
+}
+
+func (t *Task) initClients(ctx context.Context) error {
+	grpcCli, err := milvus.NewGrpc(&t.params.Milvus)
+	if err != nil {
+		return fmt.Errorf("backup: create grpc client: %w", err)
+	}
+	t.grpc = grpcCli
+
+	restfulCli, err := milvus.NewRestful(&t.params.Milvus)
+	if err != nil {
+		return fmt.Errorf("backup: create restful client: %w", err)
+	}
+	t.restful = restfulCli
+
+	manageAddr := t.params.Milvus.Management.Endpoint.Val
+	if t.option.ManageAddr != "" {
+		manageAddr = t.option.ManageAddr
+	}
+	t.manage = milvus.NewManage(manageAddr)
+
+	// etcd is read only by the index extra and dynamic field steps, and both run
+	// after every collection has been copied. Probe it here instead, so a cluster
+	// whose etcd this tool cannot reach fails in the first seconds of the backup
+	// rather than at the end of it.
+	if t.option.BackupIndexExtra {
+		endpoints := t.params.Milvus.Etcd.Endpoints.Val
+		etcdCli, err := clientv3.New(clientv3.Config{
+			Endpoints:   endpoints,
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("backup: create etcd client: %w", err)
+		}
+		t.etcdCli = etcdCli
+		t.etcd = newEtcdMeta(etcdCli, endpoints)
+
+		if err := t.etcd.probe(ctx); err != nil {
+			return err
+		}
+	}
+
+	t.gcCtrl = newGCCtrl(t.taskID, t.option.PauseGC, t.grpc, t.manage)
+
+	return nil
+}
+
+func (t *Task) closeClients() {
+	if t.grpc != nil {
+		if err := t.grpc.Close(); err != nil {
+			t.logger.Warn("close grpc client", zap.Error(err))
+		}
+	}
+	if t.etcdCli != nil {
+		if err := t.etcdCli.Close(); err != nil {
+			t.logger.Warn("close etcd client", zap.Error(err))
+		}
+	}
+}
+
+var _ tasklet.Tasklet = (*Task)(nil)
+
+// Execute runs the backup. The outcome is only the answer: recording it as
+// the job's terminal state is the job's business, not the task's.
+func (t *Task) Execute(ctx context.Context) error {
+	defer t.closeClients()
+
+	if err := t.initClients(ctx); err != nil {
+		return err
+	}
+
+	return t.privateExecute(ctx)
+}
+
+func (t *Task) privateExecute(ctx context.Context) error {
+	version, err := t.grpc.GetVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("backup: get milvus version: %w", err)
+	}
+	t.metaBuilder.setVersion(version)
+
+	format, err := t.resolveFormat()
+	if err != nil {
+		return err
+	}
+	t.resolvedFormat = format
+	t.metaBuilder.setFormat(format)
+
+	// Pausing GC is the binlog path's way of holding the files still while they are
+	// copied one by one. A snapshot does that itself, unconditionally and only for the
+	// collection being backed up, so the cluster-wide advisory is not asked for.
+	if t.resolvedFormat != meta.FormatSnapshot {
+		t.gcCtrl.PauseGC(ctx)
+		defer t.gcCtrl.ResumeGC(ctx)
+	}
+
+	if t.resolvedFormat == meta.FormatSnapshot {
+		target, err := newSnapshotTarget(t.milvusStorage.Config(), t.backupStorage.Config(), t.backupDir)
+		if err != nil {
+			return fmt.Errorf("backup: build snapshot target: %w", err)
+		}
+		t.snapshotTarget = target
+		t.logger.Info("use snapshot format",
+			zap.String("bundle_dir", target.dir),
+			zap.String("bundle_uri", target.rootURI))
+	}
+
+	dbNames, collections, err := t.listDBAndNames(ctx)
+	if err != nil {
+		return fmt.Errorf("backup: list db and collection: %w", err)
+	}
+
+	collections, err = t.excludeExternalColl(ctx, collections)
+	if err != nil {
+		return fmt.Errorf("backup: exclude external collection: %w", err)
+	}
+
+	if err := t.backupDatabase(ctx, dbNames); err != nil {
+		return fmt.Errorf("backup: run db task: %w", err)
+	}
+
+	if err := t.backupCollection(ctx, collections); err != nil {
+		return fmt.Errorf("backup: run collection task: %w", err)
+	}
+
+	if err := t.backupRBAC(ctx); err != nil {
+		return fmt.Errorf("backup: run rbac task: %w", err)
+	}
+
+	t.backupRPCChannelPOS(ctx)
+
+	if err := t.backupIndexExtraInfo(ctx); err != nil {
+		return fmt.Errorf("backup: run index extra info task: %w", err)
+	}
+
+	if err := t.backupCollDynField(ctx); err != nil {
+		return fmt.Errorf("backup: run coll dyn field task: %w", err)
+	}
+
+	if err := t.writeMeta(ctx); err != nil {
+		return fmt.Errorf("backup: write meta: %w", err)
+	}
+
+	t.logger.Info("backup successfully")
+	return nil
+}
+
+// resolveFormat maps the requested format to the artifact the backup is written
+// in. Auto follows the version fork: a 3.0 or newer server gets the snapshot
+// format, anything older falls back to binlogs. --format=snapshot needs a 3.0+
+// server. --format=binlog is accepted on any server for now: milvus master has
+// not implemented ExportSnapshot yet, so auto cannot rely on it there, and the
+// explicit pin is the way to keep producing binlog backups on the 3.0 line.
+// Revisit the acceptance once the export lands on master.
+//
+// The storage fork comes on top of the version one: a snapshot is copied by the
+// server inside one storage service, so a backup target on another service — a
+// different provider, or a second self-hosted endpoint — cannot take one.
+// There is no binlog fallback to offer on a 3.0 server, so both auto and the
+// explicit pin fail here with the reason instead of a server-side copy error.
+func (t *Task) resolveFormat() (string, error) {
+	if t.option.Format == FormatBinlog {
+		return meta.FormatBinlog, nil
+	}
+
+	// Auto and the explicit pin both ask for a snapshot from here on; they part
+	// ways only when the server cannot do one.
+	if !t.grpc.HasFeature(milvus.Snapshot) {
+		if t.option.Format == FormatAuto {
+			return meta.FormatBinlog, nil
+		}
+		return "", fmt.Errorf("backup: the snapshot format needs a milvus 3.0 or newer server")
+	}
+
+	return meta.FormatSnapshot, nil
+}
+
+// newDataTask builds the per-collection data task for the resolved format. The
+// plans go through this factory, so one flush orchestration runs whichever
+// artifact the format asks for.
+func (t *Task) newDataTask(format string) dataTaskFactory {
+	return func(collRef collref.Name, args collTaskArgs) tasklet.Tasklet {
+		if format == meta.FormatSnapshot {
+			// The plan's flush is what makes the boundary fresh: a snapshot admits only
+			// the segments below its channel seek positions, so without one it would
+			// hold whatever the last automatic flush left behind.
+			//
+			// Each collection creates its snapshot immediately before the export that
+			// pins it, so no snapshot sits unpinned waiting its turn. The DML
+			// semaphore bounds how many exports are in flight: a job starts its timeout
+			// when DataCoord accepts it, so anything queued beyond what
+			// dataCoord.snapshot.exportMaxConcurrentJobs can run burns that budget.
+			return newCollSnapshotTask(collRef, t.snapshotName(), t.snapshotTarget, args, t.option.DropSnapshotIfExists)
+		}
+
+		return newCollDMLTask(collRef, args)
+	}
+}
+
+// snapshotName is what the collection is frozen under while it is exported. Backup
+// names allow a leading digit and snapshot names do not, hence the prefix; the backup
+// name itself is already restricted to letters, digits and underscores.
+func (t *Task) snapshotName() string { return "mbk_" + t.option.BackupName }
+
+func (t *Task) listDBAndNames(ctx context.Context) ([]string, []collref.Name, error) {
+	f := t.option.Filter
+
+	if f.DBCollFilter == nil {
+		return t.listAllDBAndNames(ctx)
+	}
+
+	return t.listFilteredDBAndNames(ctx, f)
+}
+
+func (t *Task) listAllDBAndNames(ctx context.Context) ([]string, []collref.Name, error) {
+	var dbNames []string
+	var err error
+
+	if t.grpc.HasFeature(milvus.MultiDatabase) {
+		dbNames, err = t.grpc.ListDatabases(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("backup: list databases: %w", err)
+		}
+	} else {
+		dbNames = []string{collref.DefaultDBName}
+	}
+
+	var collRefs []collref.Name
+	for _, dbName := range dbNames {
+		resp, err := t.grpc.ListCollections(ctx, dbName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("backup: list collections for db %s: %w", dbName, err)
+		}
+		for _, coll := range resp.CollectionNames {
+			collRefs = append(collRefs, collref.New(dbName, coll))
+		}
+	}
+
+	t.logger.Info("listed all collections",
+		zap.Strings("db", dbNames),
+		zap.Strings("colls", nameStrings(collRefs)))
+
+	return dbNames, collRefs, nil
+}
+
+func (t *Task) listFilteredDBAndNames(ctx context.Context, f filter.Filter) ([]string, []collref.Name, error) {
+	// With filter: process each filter entry:
+	// - db.*: list all collections in the db
+	// - db.coll1,db.coll2: list collections with existence check
+	// - db.: database only (no collections)
+	dbNameSet := make(map[string]struct{}, len(f.DBCollFilter))
+	var collRefs []collref.Name
+
+	for dbName, collFilter := range f.DBCollFilter {
+		dbNameSet[dbName] = struct{}{}
+
+		if collFilter.AllowAll {
+			resp, err := t.grpc.ListCollections(ctx, dbName)
+			if err != nil {
+				return nil, nil, fmt.Errorf("backup: list collections for db %s: %w", dbName, err)
+			}
+			for _, coll := range resp.CollectionNames {
+				collRefs = append(collRefs, collref.New(dbName, coll))
+			}
+			continue
+		}
+
+		for collName := range collFilter.CollName {
+			exists, err := t.grpc.HasCollection(ctx, dbName, collName)
+			if err != nil {
+				return nil, nil, fmt.Errorf("backup: check collection %s.%s: %w", dbName, collName, err)
+			}
+			if !exists {
+				return nil, nil, fmt.Errorf("backup: filter collection %s.%s not found in milvus", dbName, collName)
+			}
+			collRefs = append(collRefs, collref.New(dbName, collName))
+		}
+	}
+
+	dbNames := make([]string, 0, len(dbNameSet))
+	for dbName := range dbNameSet {
+		dbNames = append(dbNames, dbName)
+	}
+
+	t.logger.Info("listed collections (filtered)",
+		zap.Strings("db", dbNames),
+		zap.Strings("colls", nameStrings(collRefs)))
+
+	return dbNames, collRefs, nil
+}
+
+// excludeExternalColl drops the external collections from the given list. An external collection
+// only holds a mapping to data owned by an external source, so Milvus has no binlog to
+// copy and a restore has nothing to rebuild it from. Backing one up would produce an
+// entry that can never be restored, so skip it and keep going with the rest.
+func (t *Task) excludeExternalColl(ctx context.Context, collRefs []collref.Name) ([]collref.Name, error) {
+	remain := make([]collref.Name, 0, len(collRefs))
+	var external []collref.Name
+
+	for _, collRef := range collRefs {
+		resp, err := t.grpc.DescribeCollection(ctx, collRef.DBName(), collRef.CollName())
+		if err != nil {
+			return nil, fmt.Errorf("backup: describe collection %s: %w", collRef, err)
+		}
+
+		if typeutil.IsExternalCollection(resp.GetSchema()) {
+			external = append(external, collRef)
+			continue
+		}
+		remain = append(remain, collRef)
+	}
+
+	if len(external) != 0 {
+		t.logger.Info("skip external collections, their data is not stored in milvus",
+			zap.Strings("colls", nameStrings(external)))
+	}
+
+	return remain, nil
+}
+
+func nameStrings(collRefs []collref.Name) []string {
+	out := make([]string, 0, len(collRefs))
+	for _, collRef := range collRefs {
+		out = append(out, collRef.String())
+	}
+	return out
+}
+
+func (t *Task) backupDatabase(ctx context.Context, dbNames []string) error {
+	t.logger.Info("start backup databases", zap.Int("count", len(dbNames)))
+	t.tracker.SetDatabaseExecuting()
+
+	for _, dbName := range dbNames {
+		dbTask := newDatabaseTask(t.taskID, dbName, t.grpc, t.manage, t.metaBuilder)
+		if err := dbTask.Execute(ctx); err != nil {
+			return fmt.Errorf("backup: execute db task %s: %w", dbName, err)
+		}
+	}
+
+	t.logger.Info("backup db done")
+
+	return nil
+}
+
+func (t *Task) newCollTaskArgs() collTaskArgs {
+	return collTaskArgs{
+		TaskID:         t.taskID,
+		tracker:        t.tracker,
+		MilvusStorage:  t.milvusStorage,
+		MilvusRootPath: t.milvusRootPath,
+		Streaming:      t.streaming,
+		BackupStorage:  t.backupStorage,
+		BackupDir:      t.backupDir,
+		Throttling:     t.throttling,
+		MetaBuilder:    t.metaBuilder,
+		Grpc:           t.grpc,
+		Restful:        t.restful,
+		gcCtrl:         t.gcCtrl,
+	}
+}
+
+func (t *Task) backupCollection(ctx context.Context, collRefs []collref.Name) error {
+	t.logger.Info("start backup collections", zap.Int("count", len(collRefs)))
+
+	// The binlog format copies through this process and counts bytes; the
+	// snapshot format watches a Milvus export job and counts its files.
+	unit := jobstate.BackupUnitBytes
+	if t.resolvedFormat == meta.FormatSnapshot {
+		unit = jobstate.BackupUnitFiles
+	}
+	t.tracker.SetCollectionExecuting(unit)
+
+	plan, err := t.selectPlan(collRefs, t.option.Strategy, t.resolvedFormat)
+	if err != nil {
+		return fmt.Errorf("backup: select plan: %w", err)
+	}
+	if err := plan.Execute(ctx); err != nil {
+		return fmt.Errorf("backup: execute collection plan: %w", err)
+	}
+
+	t.logger.Info("backup all collections successfully")
+
+	return nil
+}
+
+// selectPlan composes the two option axes into the plan that runs: the strategy
+// picks the flush orchestration, the format picks what artifact its data step
+// produces. The plans themselves know nothing about the format — they receive
+// the factory that does.
+func (t *Task) selectPlan(collRefs []collref.Name, strategy Strategy, format string) (tasklet.Tasklet, error) {
+	args := t.newCollTaskArgs()
+	newData := t.newDataTask(format)
+
+	switch strategy {
+	case StrategyAuto:
+		if t.grpc.HasFeature(milvus.FlushAll) {
+			t.logger.Info("use bulk flush plan")
+			return newBulkFlushPlan(collRefs, args, newData), nil
+		}
+		t.logger.Info("use serial flush plan")
+		return newSerialFlushPlan(collRefs, args, newData), nil
+	case StrategyMetaOnly:
+		t.logger.Info("use meta only plan")
+		return newMetaOnlyPlan(collRefs, args), nil
+	case StrategySkipFlush:
+		t.logger.Info("use skip flush plan")
+		return newSkipFlushPlan(collRefs, args, newData), nil
+	case StrategyBulkFlush:
+		t.logger.Info("use bulk flush plan")
+		return newBulkFlushPlan(collRefs, args, newData), nil
+	case StrategySerialFlush:
+		t.logger.Info("use serial flush plan")
+		return newSerialFlushPlan(collRefs, args, newData), nil
+	default:
+		return nil, fmt.Errorf("backup: unsupported strategy: %s", strategy)
+	}
+}
+
+func (t *Task) backupRBAC(ctx context.Context) error {
+	if !t.option.BackupRBAC {
+		t.logger.Info("skip backup rbac")
+		return nil
+	}
+
+	rt := NewRBACTask(t.taskID, t.metaBuilder, t.grpc)
+	if err := rt.Execute(ctx); err != nil {
+		return fmt.Errorf("backup: execute rbac task: %w", err)
+	}
+
+	return nil
+}
+
+// backupRPCChannelPOS backs up the RPC channel position for CDC incremental replication.
+// This is only needed for Milvus 2.5.x CDC, which is no longer maintained.
+// Consider removing this entirely in the future.
+func (t *Task) backupRPCChannelPOS(ctx context.Context) {
+	if !t.grpc.HasFeature(milvus.ReplicateMessage) {
+		t.logger.Info("skip backup rpc channel pos, replicate message not supported in this version")
+		return
+	}
+	t.logger.Info("start backup rpc channel pos")
+	rpcPosTask := newRPCChannelPOSTask(t.taskID, t.rpcChannelName, t.grpc, t.metaBuilder)
+	if err := rpcPosTask.Execute(ctx); err != nil {
+		t.logger.Warn(_rpcChWarnMessage, zap.Error(err))
+		return
+	}
+	t.logger.Info("backup rpc channel pos done")
+}
+
+func (t *Task) backupIndexExtraInfo(ctx context.Context) error {
+	if !t.option.BackupIndexExtra {
+		t.logger.Info("skip backup index extra info")
+		return nil
+	}
+
+	if t.etcd == nil {
+		return errors.New("backup: need backup etcd info but etcd client is nil")
+	}
+
+	t.logger.Info("start backup index extra info")
+
+	indexExtraTask := newCollIndexExtraTask(t.taskID, t.etcd, t.etcdRootPath, t.metaBuilder)
+	if err := indexExtraTask.Execute(ctx); err != nil {
+		return fmt.Errorf("backup: execute index extra task: %w", err)
+	}
+
+	return nil
+}
+
+// backupCollDynField reads each collection's dynamic field ($meta) schema
+// directly from etcd and stores it in the backup metadata. This is necessary
+// because the Milvus DescribeCollection API filters out IsDynamic fields, so
+// the gRPC-based binlog path never sees the actual $meta attributes
+// (Nullable, DefaultValue, ...). Without this info, secondary restore would
+// reconstruct the field with hardcoded defaults that may not match the source
+// collection. See zilliztech/milvus-backup#1013.
+//
+// The snapshot format never gets here: every collection of that format is
+// backed up through a snapshot task, whose bundle metadata carries the internal
+// schema — catalog truth the proxy filter does not touch — and records the
+// $meta field from it, failing the backup if a dynamic schema arrived without
+// one. The format branch below is that guarantee's other half, not a fallback:
+// there is no population of snapshot collections etcd could still complete.
+//
+// Reuses the etcd client created for BackupIndexExtra; if etcd is not
+// configured (BackupIndexExtra disabled) the task is skipped.
+//
+// Skipping is not an error: a regular restore recreates $meta through
+// CreateCollection and never reads the stored copy. A secondary restore does
+// read it, and refuses a backup without it, so the skip is logged at warn level
+// naming the collections it leaves incomplete -- that message is the only place
+// the missing option is visible before a restore fails on it much later.
+func (t *Task) backupCollDynField(ctx context.Context) error {
+	if t.resolvedFormat == meta.FormatSnapshot {
+		t.logger.Info("skip backup collection dynamic field, the snapshot bundles carry it")
+		return nil
+	}
+
+	if t.etcd == nil {
+		if affected := t.metaBuilder.dynamicSchemaCollections(); len(affected) > 0 {
+			t.logger.Warn("dynamic field not recorded, this backup cannot serve a secondary restore",
+				zap.Strings("collections_with_dynamic_schema", affected),
+				zap.String("reason", "index extra info is off, so there is no etcd client to read $meta with"),
+				zap.String("enable_with", "--backup_index_extra, or with_index_extra in the REST create request"))
+			return nil
+		}
+		t.logger.Info("skip backup collection dynamic field, etcd client is not initialized")
+		return nil
+	}
+
+	t.logger.Info("start backup collection dynamic field")
+
+	dynFieldTask := newCollDynFieldTask(t.taskID, t.etcd, t.etcdRootPath, t.metaBuilder)
+	if err := dynFieldTask.Execute(ctx); err != nil {
+		return fmt.Errorf("backup: execute coll dyn field task: %w", err)
+	}
+
+	return nil
+}
+
+func (t *Task) writeMeta(ctx context.Context) error {
+	t.logger.Info("start write meta")
+
+	type metaEntry struct {
+		Type mpath.MetaType
+		Fn   func() ([]byte, error)
+	}
+
+	entries := []metaEntry{
+		{Type: mpath.BackupMeta, Fn: t.metaBuilder.buildBackupMeta},
+		{Type: mpath.CollectionMeta, Fn: t.metaBuilder.buildCollectionMeta},
+	}
+	// The snapshot format has no segments, so the partition and segment files have
+	// nothing to hold. meta.Write makes the same call for the same reason: writing them
+	// empty would add a read path through levelToTree, which derives a collection's
+	// size by summing segments.
+	if t.resolvedFormat != meta.FormatSnapshot {
+		entries = append(entries,
+			metaEntry{Type: mpath.PartitionMeta, Fn: t.metaBuilder.buildPartitionMeta},
+			metaEntry{Type: mpath.SegmentMeta, Fn: t.metaBuilder.buildSegmentMeta})
+	}
+	entries = append(entries, metaEntry{Type: mpath.FullMeta, Fn: t.metaBuilder.buildFullMeta})
+
+	for _, entry := range entries {
+		data, err := entry.Fn()
+		if err != nil {
+			return fmt.Errorf("backup: build %s meta: %w", entry.Type, err)
+		}
+		err = storage.Write(ctx, t.backupStorage, mpath.MetaKey(t.backupDir, entry.Type), data)
+		if err != nil {
+			return fmt.Errorf("backup: write %s meta: %w", entry.Type, err)
+		}
+	}
+
+	t.logger.Info("finish write meta")
+	return nil
+}

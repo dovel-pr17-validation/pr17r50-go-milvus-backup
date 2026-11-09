@@ -1,0 +1,645 @@
+package backup
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/zilliztech/milvus-backup/core/proto/backuppb"
+	"github.com/zilliztech/milvus-backup/internal/client/milvus"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/storage"
+	"github.com/zilliztech/milvus-backup/internal/storage/mpath"
+)
+
+const _allPartitionID = -1
+
+// _verifyConcurrency is the max number of partition prefixes verified at the
+// same time within one collection. The collection level semaphore already
+// bounds how many collections verify at once.
+const _verifyConcurrency = 4
+
+// _maxVerifyGroupKeys is the max number of keys verified by a single prefix
+// list, roughly two list pages. A larger group is split by whole path levels
+// below its prefix until it fits, so no one list has to cover a large
+// directory subtree on gateways that walk every sub dir before returning the
+// first page.
+const _maxVerifyGroupKeys = 2000
+
+type collDMLTask struct {
+	taskID string
+
+	collRef collref.Name
+
+	milvusStorage  storage.Client
+	milvusRootPath string
+
+	streaming bool
+
+	backupStorage storage.Client
+	backupDir     string
+
+	throttling concurrencyThrottling
+
+	grpc    milvus.Grpc
+	restful milvus.Restful
+
+	gcCtrl gcCtrl
+
+	tracker     *jobstate.BackupCollDMLTracker
+	metaBuilder *metaBuilder
+
+	logger *zap.Logger
+}
+
+func newCollDMLTask(collRef collref.Name, args collTaskArgs) *collDMLTask {
+	logger := log.L().With(zap.String("task_id", args.TaskID), zap.String("coll", collRef.String()))
+	return &collDMLTask{
+		taskID: args.TaskID,
+
+		collRef: collRef,
+
+		milvusStorage:  args.MilvusStorage,
+		milvusRootPath: args.MilvusRootPath,
+
+		streaming: args.Streaming,
+
+		backupStorage: args.BackupStorage,
+		backupDir:     args.BackupDir,
+
+		throttling: args.Throttling,
+
+		grpc:    args.Grpc,
+		restful: args.Restful,
+
+		tracker:     args.tracker.NewCollDMLTracker(collRef),
+		metaBuilder: args.MetaBuilder,
+
+		gcCtrl: args.gcCtrl,
+
+		logger: logger,
+	}
+}
+
+func (dmlt *collDMLTask) listDeltaLogByAPI(ctx context.Context, binlogDir string, fieldsBinlog []milvus.BinlogInfo) ([]*backuppb.FieldBinlog, int64, error) {
+	keys, sizes, err := storage.ListPrefixFlat(ctx, dmlt.milvusStorage, binlogDir, true)
+	if err != nil {
+		return nil, 0, fmt.Errorf("backup: list insert logs %w", err)
+	}
+	keySize := make(map[string]int64, len(keys))
+	for idx, key := range keys {
+		keySize[key] = sizes[idx]
+	}
+
+	bakFieldsBinlog := make([]*backuppb.FieldBinlog, 0, len(fieldsBinlog))
+	for _, fieldBinlog := range fieldsBinlog {
+		logIDs := fieldBinlog.LogIDs
+		binlogs := make([]*backuppb.Binlog, 0, len(logIDs))
+		for _, logID := range logIDs {
+			// delta log path has no field id
+			key := mpath.Join(binlogDir, mpath.LogID(logID))
+			size, ok := keySize[key]
+			if !ok {
+				return nil, 0, fmt.Errorf("backup: log %s not exist", key)
+			}
+			binlog := &backuppb.Binlog{LogPath: key, LogId: logID, LogSize: size}
+			binlogs = append(binlogs, binlog)
+		}
+		bakFieldBinlog := &backuppb.FieldBinlog{FieldID: fieldBinlog.FieldID, Binlogs: binlogs}
+		bakFieldsBinlog = append(bakFieldsBinlog, bakFieldBinlog)
+	}
+
+	return bakFieldsBinlog, lo.Sum(sizes), nil
+}
+
+func (dmlt *collDMLTask) listInsertLogByAPI(ctx context.Context, binlogDir string, fieldsBinlog []milvus.BinlogInfo) ([]*backuppb.FieldBinlog, int64, error) {
+	keys, sizes, err := storage.ListPrefixFlat(ctx, dmlt.milvusStorage, binlogDir, true)
+	if err != nil {
+		return nil, 0, fmt.Errorf("backup: list insert logs %w", err)
+	}
+	keySize := make(map[string]int64, len(keys))
+	for idx, key := range keys {
+		keySize[key] = sizes[idx]
+	}
+
+	bakFieldsBinlog := make([]*backuppb.FieldBinlog, 0, len(fieldsBinlog))
+	for _, fieldBinlog := range fieldsBinlog {
+		logIDs := fieldBinlog.LogIDs
+		binlogs := make([]*backuppb.Binlog, 0, len(logIDs))
+		for _, logID := range logIDs {
+			key := mpath.Join(binlogDir, mpath.FieldID(fieldBinlog.FieldID), mpath.LogID(logID))
+			size, ok := keySize[key]
+			if !ok {
+				return nil, 0, fmt.Errorf("backup: log %s not exist", key)
+			}
+			binlog := &backuppb.Binlog{LogPath: key, LogId: logID, LogSize: size}
+			binlogs = append(binlogs, binlog)
+		}
+		bakFieldBinlog := &backuppb.FieldBinlog{FieldID: fieldBinlog.FieldID, Binlogs: binlogs}
+		bakFieldsBinlog = append(bakFieldsBinlog, bakFieldBinlog)
+	}
+
+	return bakFieldsBinlog, lo.Sum(sizes), nil
+}
+
+func (dmlt *collDMLTask) getSegments(ctx context.Context) ([]*backuppb.SegmentBackupInfo, error) {
+	dmlt.logger.Info("start get segments of collection")
+	segments, err := dmlt.grpc.GetPersistentSegmentInfo(ctx, dmlt.collRef.DBName(), dmlt.collRef.CollName())
+	if err != nil {
+		return nil, fmt.Errorf("backup: get persistent segment info %w", err)
+	}
+
+	// most of the segments are not l0, so we don't need to set capacity for l0SegIDs
+	var l0SegIDs []int64
+	notL0SegIDs := make([]int64, 0, len(segments))
+	for _, seg := range segments {
+		if seg.GetLevel() == commonpb.SegmentLevel_L0 {
+			l0SegIDs = append(l0SegIDs, seg.GetSegmentID())
+		} else {
+			notL0SegIDs = append(notL0SegIDs, seg.GetSegmentID())
+		}
+	}
+	dmlt.logger.Info("segments of collection", zap.Int64s("l0_segments", l0SegIDs), zap.Int64s("not_l0_segments", notL0SegIDs))
+
+	bakSegs := make([]*backuppb.SegmentBackupInfo, 0, len(segments))
+	for _, seg := range segments {
+		bakSeg, err := dmlt.getSegment(ctx, seg)
+		if err != nil {
+			return nil, fmt.Errorf("backup: get segment %w", err)
+		}
+		bakSegs = append(bakSegs, bakSeg)
+	}
+
+	return bakSegs, nil
+}
+
+func (dmlt *collDMLTask) getSegment(ctx context.Context, seg *milvuspb.PersistentSegmentInfo) (*backuppb.SegmentBackupInfo, error) {
+	dmlt.logger.Info("get segment info", zap.Int64("segment_id", seg.SegmentID))
+
+	var bakSeg *backuppb.SegmentBackupInfo
+	if dmlt.grpc.HasFeature(milvus.GetSegmentInfo) {
+		// will try to get segment info via proxy node first
+		var err error
+		bakSeg, err = dmlt.getSegmentInfoByAPI(ctx, seg)
+		if err == nil {
+			return bakSeg, nil
+		}
+		dmlt.logger.Warn("get segment info via proxy node failed, pls check whether milvus restful api is enabled", zap.Error(err))
+	}
+
+	var err error
+	// if failed, try to get segment info via list file
+	bakSeg, err = dmlt.getSegmentInfoByListFile(ctx, seg)
+	if err != nil {
+		return nil, fmt.Errorf("backup: get segment info %w", err)
+	}
+
+	return bakSeg, nil
+}
+
+func (dmlt *collDMLTask) listInsertLogByListFile(ctx context.Context, binlogDir string) ([]*backuppb.FieldBinlog, int64, error) {
+	keys, sizes, err := storage.ListPrefixFlat(ctx, dmlt.milvusStorage, binlogDir, true)
+	if err != nil {
+		return nil, 0, fmt.Errorf("backup: list insert logs %w", err)
+	}
+
+	// group binlogs by field id
+	fieldBinlogs := make(map[int64][]*backuppb.Binlog)
+	for idx, key := range keys {
+		binlog, err := mpath.ParseInsertLogPath(key)
+		if err != nil {
+			return nil, 0, fmt.Errorf("backup: parse log path %w", err)
+		}
+		bakBinlog := &backuppb.Binlog{LogId: binlog.LogID, LogSize: sizes[idx], LogPath: key}
+		fieldBinlogs[binlog.FieldID] = append(fieldBinlogs[binlog.FieldID], bakBinlog)
+	}
+
+	fields := make([]*backuppb.FieldBinlog, 0, len(fieldBinlogs))
+	var fileNum int
+	for fieldID, binlogs := range fieldBinlogs {
+		dmlt.logger.Info("get insert logs done", zap.Int64("field_id", fieldID), zap.Int("count", len(binlogs)))
+		if fileNum == 0 {
+			fileNum = len(binlogs)
+		} else if fileNum != len(binlogs) {
+			return nil, 0, fmt.Errorf("backup: field %d has different file num to other fields", fieldID)
+		}
+		fields = append(fields, &backuppb.FieldBinlog{FieldID: fieldID, Binlogs: binlogs})
+	}
+
+	return fields, lo.Sum(sizes), nil
+}
+
+func (dmlt *collDMLTask) listDeltaLogByListFile(ctx context.Context, binlogDir string) ([]*backuppb.FieldBinlog, int64, error) {
+	keys, sizes, err := storage.ListPrefixFlat(ctx, dmlt.milvusStorage, binlogDir, true)
+	if err != nil {
+		return nil, 0, fmt.Errorf("backup: list delta log %w", err)
+	}
+
+	bakBinlogs := make([]*backuppb.Binlog, 0, len(keys))
+	for idx, key := range keys {
+		binlog, err := mpath.ParseDeltaLogPath(key)
+		if err != nil {
+			return nil, 0, fmt.Errorf("backup: parse log path %w", err)
+		}
+		bakBinlog := &backuppb.Binlog{LogId: binlog.LogID, LogSize: sizes[idx], LogPath: key}
+		bakBinlogs = append(bakBinlogs, bakBinlog)
+	}
+	dmlt.logger.Info("get delta logs done", zap.Int("count", len(bakBinlogs)))
+
+	return []*backuppb.FieldBinlog{{Binlogs: bakBinlogs}}, lo.Sum(sizes), nil
+}
+
+// getSegmentInfoByListFile if milvus version < 2.5.8, we can only get segment info via list file.
+func (dmlt *collDMLTask) getSegmentInfoByListFile(ctx context.Context, seg *milvuspb.PersistentSegmentInfo) (*backuppb.SegmentBackupInfo, error) {
+	dmlt.logger.Info("get segment info via list file", zap.Int64("segment_id", seg.SegmentID))
+
+	pathOpts := []mpath.Option{
+		mpath.CollectionID(seg.GetCollectionID()),
+		mpath.PartitionID(seg.GetPartitionID()),
+		mpath.SegmentID(seg.GetSegmentID()),
+	}
+
+	insertLogDir := mpath.MilvusInsertLogDir(dmlt.milvusRootPath, pathOpts...)
+	dmlt.logger.Debug("insert log dir", zap.String("dir", insertLogDir))
+	insertLogs, iSize, err := dmlt.listInsertLogByListFile(ctx, insertLogDir)
+	if err != nil {
+		return nil, fmt.Errorf("backup: list insert logs %w", err)
+	}
+	dmlt.logger.Info("get insert logs done", zap.Int("count", len(insertLogs)))
+
+	deltaLogDir := mpath.MilvusDeltaLogDir(dmlt.milvusRootPath, pathOpts...)
+	dmlt.logger.Debug("delta log dir", zap.String("dir", deltaLogDir))
+	deltaLogs, dSize, err := dmlt.listDeltaLogByListFile(ctx, deltaLogDir)
+	if err != nil {
+		return nil, fmt.Errorf("backup: list delta logs %w", err)
+	}
+	dmlt.logger.Info("get delta logs done", zap.Int("count", len(deltaLogs)))
+
+	return &backuppb.SegmentBackupInfo{
+		SegmentId:      seg.GetSegmentID(),
+		CollectionId:   seg.GetCollectionID(),
+		PartitionId:    seg.GetPartitionID(),
+		NumOfRows:      seg.GetNumRows(),
+		StorageVersion: seg.GetStorageVersion(),
+		GroupId:        dmlt.groupID(seg),
+		IsL0:           seg.GetLevel() == commonpb.SegmentLevel_L0,
+		Binlogs:        insertLogs,
+		Deltalogs:      deltaLogs,
+		Size:           iSize + dSize,
+	}, nil
+}
+
+// groupID generates a virtual partition ID for batch importing multiple segments.
+// When the partition ID is -1, it means that the segment applies to all partitions.
+// Therefore, it requires special handling and cannot participate in batch import, so groupID returns 0.
+func (dmlt *collDMLTask) groupID(seg *milvuspb.PersistentSegmentInfo) int64 {
+	if seg.GetPartitionID() == _allPartitionID {
+		return 0
+	}
+
+	return seg.GetSegmentID()
+}
+
+// getSegmentDetailByAPI if milvus version > 2.5.8, we have a new api to get the segment info via proxy node.
+// see: https://github.com/milvus-io/milvus/pull/40464
+func (dmlt *collDMLTask) getSegmentInfoByAPI(ctx context.Context, seg *milvuspb.PersistentSegmentInfo) (*backuppb.SegmentBackupInfo, error) {
+	dmlt.logger.Info("try get segment info via proxy node", zap.Int64("segment_id", seg.SegmentID))
+	segInfo, err := dmlt.restful.GetSegmentInfo(ctx, dmlt.collRef.DBName(), seg.CollectionID, seg.SegmentID)
+	if err != nil {
+		return nil, fmt.Errorf("backup: get segment info %w", err)
+	}
+	pathOpts := []mpath.Option{
+		mpath.CollectionID(seg.CollectionID),
+		mpath.PartitionID(seg.PartitionID),
+		mpath.SegmentID(seg.SegmentID),
+	}
+
+	insertLogDir := mpath.MilvusInsertLogDir(dmlt.milvusRootPath, pathOpts...)
+	insertLogs, iSize, err := dmlt.listInsertLogByAPI(ctx, insertLogDir, segInfo.InsertLogs)
+	if err != nil {
+		return nil, fmt.Errorf("backup: list insert logs %w", err)
+	}
+
+	deltaLogDir := mpath.MilvusDeltaLogDir(dmlt.milvusRootPath, pathOpts...)
+	deltaLogs, dSize, err := dmlt.listDeltaLogByAPI(ctx, deltaLogDir, segInfo.DeltaLogs)
+	if err != nil {
+		return nil, fmt.Errorf("backup: list delta logs %w", err)
+	}
+
+	bakSeg := &backuppb.SegmentBackupInfo{
+		SegmentId:      seg.GetSegmentID(),
+		CollectionId:   seg.GetCollectionID(),
+		PartitionId:    seg.GetPartitionID(),
+		NumOfRows:      seg.GetNumRows(),
+		StorageVersion: seg.GetStorageVersion(),
+		Binlogs:        insertLogs,
+		Deltalogs:      deltaLogs,
+		GroupId:        dmlt.groupID(seg),
+		IsL0:           seg.GetLevel() == commonpb.SegmentLevel_L0,
+		Size:           iSize + dSize,
+		VChannel:       segInfo.VChannel,
+	}
+
+	return bakSeg, nil
+}
+
+// Execute backs up the collection's data: segment listing into the meta, then
+// the binlog copy and its verification. The state half settles here — the
+// task that did the work records its own outcome.
+func (dmlt *collDMLTask) Execute(ctx context.Context) error {
+	dmlt.logger.Info("start to backup dml of collection")
+	dmlt.tracker.SetPrepare()
+
+	if err := dmlt.execute(ctx); err != nil {
+		dmlt.tracker.SetFail(err)
+		return err
+	}
+
+	dmlt.tracker.SetSuccess()
+	dmlt.logger.Info("backup dml of collection done")
+
+	return nil
+}
+
+func (dmlt *collDMLTask) execute(ctx context.Context) error {
+	describe, err := dmlt.grpc.DescribeCollection(ctx, dmlt.collRef.DBName(), dmlt.collRef.CollName())
+	if err != nil {
+		return fmt.Errorf("backup: describe collection %w", err)
+	}
+	dmlt.gcCtrl.PauseCollectionGC(ctx, describe.CollectionID)
+	defer dmlt.gcCtrl.ResumeCollectionGC(ctx, describe.CollectionID)
+
+	segments, err := dmlt.getSegments(ctx)
+	if err != nil {
+		return fmt.Errorf("backup: get segments %w", err)
+	}
+
+	dmlt.metaBuilder.addSegments(segments)
+
+	size := lo.SumBy(segments, func(seg *backuppb.SegmentBackupInfo) int64 { return seg.GetSize() })
+	dmlt.tracker.SetExecuting(size)
+
+	if err := dmlt.backupSegmentsData(ctx, segments); err != nil {
+		return fmt.Errorf("backup: backup segments %w", err)
+	}
+
+	if err := dmlt.verifySegmentsData(ctx, describe.CollectionID, segments); err != nil {
+		return fmt.Errorf("backup: verify segments %w", err)
+	}
+
+	return nil
+}
+
+// verifySegmentsData verifies that every copied binlog exists in the backup
+// storage with a matching size. The destination keys all live under the
+// collection-level insert_log and delta_log dirs, verified by recursive lists
+// split by whole path levels until each covers at most _maxVerifyGroupKeys
+// keys. Some S3-compatible gateways backed by a hierarchical storage build a
+// recursive (no delimiter) list response by walking every sub dir before
+// returning the first page, so one list of a large collection dir can exceed
+// the client response header timeout, while bounded lists stay fast. Splitting
+// the list also lets the groups run in parallel.
+func (dmlt *collDMLTask) verifySegmentsData(ctx context.Context, collID int64, segments []*backuppb.SegmentBackupInfo) error {
+	insertExpected := make(map[string]int64)
+	deltaExpected := make(map[string]int64)
+	for _, seg := range segments {
+		insertAttrs, err := dmlt.insertLogsAttrs(seg)
+		if err != nil {
+			return fmt.Errorf("backup: build insert log expected %w", err)
+		}
+		for _, attr := range insertAttrs {
+			insertExpected[attr.DestKey] = attr.Src.Length
+		}
+
+		deltaAttrs, err := dmlt.deltaLogAttrs(seg)
+		if err != nil {
+			return fmt.Errorf("backup: build delta log expected %w", err)
+		}
+		for _, attr := range deltaAttrs {
+			deltaExpected[attr.DestKey] = attr.Src.Length
+		}
+	}
+
+	insertDir := mpath.BackupInsertLogDir(dmlt.backupDir, mpath.CollectionID(collID))
+	if err := dmlt.verifyByChildPrefix(ctx, insertDir, insertExpected); err != nil {
+		return fmt.Errorf("backup: verify insert logs %w", err)
+	}
+
+	deltaDir := mpath.BackupDeltaLogDir(dmlt.backupDir, mpath.CollectionID(collID))
+	if err := dmlt.verifyByChildPrefix(ctx, deltaDir, deltaExpected); err != nil {
+		return fmt.Errorf("backup: verify delta logs %w", err)
+	}
+
+	return nil
+}
+
+// verifyByChildPrefix splits expected by whole path levels below dir until
+// each group fits _maxVerifyGroupKeys, and runs one VerifyPrefixTask per leaf
+// group, at most _verifyConcurrency at a time.
+func (dmlt *collDMLTask) verifyByChildPrefix(ctx context.Context, dir string, expected map[string]int64) error {
+	leaves := splitByPrefix(dir, expected)
+	prefixes := slices.Sorted(maps.Keys(leaves))
+
+	g, subCtx := errgroup.WithContext(ctx)
+	g.SetLimit(_verifyConcurrency)
+	for _, prefix := range prefixes {
+		g.Go(func() error {
+			task := storage.NewVerifyPrefixTask(storage.VerifyPrefixOpt{
+				Cli:      dmlt.backupStorage,
+				Prefix:   prefix,
+				Expected: leaves[prefix],
+			})
+			if err := task.Execute(subCtx); err != nil {
+				return fmt.Errorf("prefix %s: %w", prefix, err)
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// splitByNextLevel groups expected keys by dir + the first path element
+// after dir (e.g. ".../insert_log/{coll}/" -> ".../insert_log/{coll}/{part}/").
+// Keys that are not under dir, or have no sub dir below it, are grouped under
+// dir itself, so they are still verified by a list of the whole dir.
+func splitByNextLevel(dir string, expected map[string]int64) map[string]map[string]int64 {
+	groups := make(map[string]map[string]int64)
+	for key, size := range expected {
+		prefix := dir
+		if rest, ok := strings.CutPrefix(key, dir); ok {
+			if idx := strings.Index(rest, "/"); idx > 0 {
+				prefix = dir + rest[:idx+1]
+			}
+		}
+
+		if _, ok := groups[prefix]; !ok {
+			groups[prefix] = make(map[string]int64)
+		}
+		groups[prefix][key] = size
+	}
+
+	return groups
+}
+
+// splitByPrefix splits expected into disjoint groups, each small enough for
+// one prefix list: a group of at most _maxVerifyGroupKeys keys stays whole,
+// a larger one is split by its next path level and each child recurses. A
+// group that cannot be split — its keys sit directly under the prefix or
+// outside it — stays whole even above the bound, and one paged list covers
+// it: a flat set of files walks a single dir on a hierarchical backend. The
+// split only looks at the key strings, so it needs no knowledge of the
+// storage layout.
+func splitByPrefix(dir string, expected map[string]int64) map[string]map[string]int64 {
+	if len(expected) <= _maxVerifyGroupKeys {
+		return map[string]map[string]int64{dir: expected}
+	}
+
+	groups := splitByNextLevel(dir, expected)
+	if len(groups) == 1 {
+		if _, ok := groups[dir]; ok {
+			// every key sits under dir itself or outside it: splitting again
+			// would recurse on the same input, so the group stays whole.
+			return groups
+		}
+	}
+
+	leaves := make(map[string]map[string]int64)
+	for prefix, keys := range groups {
+		for leaf, leafKeys := range splitByPrefix(prefix, keys) {
+			leaves[leaf] = leafKeys
+		}
+	}
+	return leaves
+}
+
+func (dmlt *collDMLTask) backupSegmentsData(ctx context.Context, segments []*backuppb.SegmentBackupInfo) error {
+	dmlt.logger.Info("start to backup segments", zap.Int("segment_num", len(segments)))
+	g, subCtx := errgroup.WithContext(ctx)
+	for _, seg := range segments {
+		if err := dmlt.throttling.SegSem.Acquire(ctx, 1); err != nil {
+			return fmt.Errorf("backup: acquire segment semaphore %w", err)
+		}
+
+		g.Go(func() error {
+			defer dmlt.throttling.SegSem.Release(1)
+
+			if err := dmlt.backupSegmentData(subCtx, seg); err != nil {
+				return fmt.Errorf("backup: copy segment %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("backup: wait backup segments %w", err)
+	}
+
+	dmlt.logger.Info("backup segments done")
+
+	return nil
+}
+
+func (dmlt *collDMLTask) insertLogsAttrs(seg *backuppb.SegmentBackupInfo) ([]storage.CopyAttr, error) {
+	opts := []mpath.Option{
+		mpath.CollectionID(seg.GetCollectionId()),
+		mpath.PartitionID(seg.GetPartitionId()),
+		mpath.SegmentID(seg.GetSegmentId()),
+		mpath.GroupID(seg.GetGroupId()),
+	}
+	destDir := mpath.BackupInsertLogDir(dmlt.backupDir, opts...)
+
+	var attrs []storage.CopyAttr
+	for _, field := range seg.GetBinlogs() {
+		fieldAttrs := make([]storage.CopyAttr, 0, len(field.GetBinlogs()))
+		for _, binlog := range field.GetBinlogs() {
+			destKey := mpath.Join(destDir, mpath.FieldID(field.FieldID), mpath.LogID(binlog.LogId))
+			if destKey == binlog.LogPath {
+				return nil, fmt.Errorf("backup: dest key %s is same as src key %s", destKey, binlog.LogPath)
+			}
+
+			srcAttr := storage.ObjectAttr{Key: binlog.LogPath, Length: binlog.LogSize}
+			fieldAttrs = append(fieldAttrs, storage.CopyAttr{Src: srcAttr, DestKey: destKey})
+		}
+		attrs = append(attrs, fieldAttrs...)
+	}
+
+	return attrs, nil
+}
+
+func (dmlt *collDMLTask) deltaLogAttrs(seg *backuppb.SegmentBackupInfo) ([]storage.CopyAttr, error) {
+	opts := []mpath.Option{
+		mpath.CollectionID(seg.GetCollectionId()),
+		mpath.PartitionID(seg.GetPartitionId()),
+		mpath.SegmentID(seg.GetSegmentId()),
+	}
+	if seg.GetPartitionId() != _allPartitionID {
+		opts = append(opts, mpath.GroupID(seg.GetGroupId()))
+	}
+	destDir := mpath.BackupDeltaLogDir(dmlt.backupDir, opts...)
+
+	var attrs []storage.CopyAttr
+	for _, field := range seg.GetDeltalogs() {
+		fieldAttrs := make([]storage.CopyAttr, 0, len(field.GetBinlogs()))
+		for _, binlog := range field.GetBinlogs() {
+			destKey := mpath.Join(destDir, mpath.LogID(binlog.LogId))
+			if destKey == binlog.LogPath {
+				return nil, fmt.Errorf("backup: dest key %s is same as src key %s", destKey, binlog.LogPath)
+			}
+
+			srcAttr := storage.ObjectAttr{Key: binlog.LogPath, Length: binlog.LogSize}
+			fieldAttrs = append(fieldAttrs, storage.CopyAttr{Src: srcAttr, DestKey: destKey})
+		}
+		attrs = append(attrs, fieldAttrs...)
+	}
+
+	return attrs, nil
+}
+
+func (dmlt *collDMLTask) backupSegmentData(ctx context.Context, seg *backuppb.SegmentBackupInfo) error {
+	dmlt.logger.Info("backup binlogs of segment", zap.Int64("segment_id", seg.GetSegmentId()))
+	insertAttrs, err := dmlt.insertLogsAttrs(seg)
+	if err != nil {
+		return fmt.Errorf("backup: backup insert logs %w", err)
+	}
+	if len(insertAttrs) == 0 && !seg.GetIsL0() {
+		return fmt.Errorf("backup: segment %d has no insert logs", seg.GetSegmentId())
+	}
+	deltaAttrs, err := dmlt.deltaLogAttrs(seg)
+	if err != nil {
+		return fmt.Errorf("backup: backup delta logs %w", err)
+	}
+
+	attrs := make([]storage.CopyAttr, 0, len(insertAttrs)+len(deltaAttrs))
+	attrs = append(attrs, insertAttrs...)
+	attrs = append(attrs, deltaAttrs...)
+	opt := storage.CopyObjectsOpt{
+		Src:       dmlt.milvusStorage,
+		Dest:      dmlt.backupStorage,
+		Attrs:     attrs,
+		Streaming: dmlt.streaming,
+		Sem:       dmlt.throttling.CopySem,
+		TraceFn: func(size int64) {
+			dmlt.tracker.AddCopiedSize(size)
+		},
+	}
+	cpTask := storage.NewCopyObjectsTask(opt)
+	if err := cpTask.Execute(ctx); err != nil {
+		return fmt.Errorf("backup: copy bin logs %w", err)
+	}
+
+	dmlt.logger.Info("backup binlogs of segment done", zap.Int64("segment_id", seg.GetSegmentId()))
+
+	return nil
+}

@@ -1,0 +1,181 @@
+package cloud
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/imroc/req/v3"
+	"go.uber.org/zap"
+
+	"github.com/zilliztech/milvus-backup/internal/log"
+)
+
+type statusCoder interface {
+	code() int
+}
+
+type common[T any] struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    T      `json:"data"`
+}
+
+func (c *common[T]) code() int { return c.Code }
+
+type Credentials struct {
+	ExpireTime   string `json:"expireTime"`
+	SessionToken string `json:"sessionToken"`
+	TmpAK        string `json:"tmpAK"`
+	TmpSK        string `json:"tmpSK"`
+}
+
+// mask renders a set credential as a fixed mask, keeping empty empty so set
+// and unset stay distinguishable. No value characters are retained: any
+// retained character confirms guesses at weak values.
+func mask(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+
+	return "****"
+}
+
+func (cred *Credentials) String() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "expireTime: %s, ", cred.ExpireTime)
+	fmt.Fprintf(&sb, "sessionToken: %s, ", mask(cred.SessionToken))
+	fmt.Fprintf(&sb, "tmpAK: %s, ", mask(cred.TmpAK))
+	fmt.Fprintf(&sb, "tmpSK: %s", mask(cred.TmpSK))
+
+	return sb.String()
+}
+
+type Condition struct {
+	MaxContentLength int `json:"maxContentLength"`
+}
+
+func (c *Condition) String() string {
+	return fmt.Sprintf("maxContentLength: %d", c.MaxContentLength)
+}
+
+type ApplyVolumeResp struct {
+	BucketName  string      `json:"bucketName"`
+	Cloud       string      `json:"cloud"`
+	Condition   Condition   `json:"condition"`
+	Credentials Credentials `json:"credentials"`
+	Endpoint    string      `json:"endpoint"`
+	Region      string      `json:"region"`
+	UploadPath  string      `json:"uploadPath"`
+	VolumeName  string      `json:"volumeName"`
+}
+
+func (a *ApplyVolumeResp) String() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "bucketName: %s, ", mask(a.BucketName))
+	fmt.Fprintf(&sb, "cloud: %s, ", a.Cloud)
+	fmt.Fprintf(&sb, "condition: %s, ", a.Condition.String())
+	fmt.Fprintf(&sb, "credentials: %s, ", a.Credentials.String())
+	fmt.Fprintf(&sb, "endpoint: %s, ", a.Endpoint)
+	fmt.Fprintf(&sb, "region: %s, ", a.Region)
+	fmt.Fprintf(&sb, "uploadPath: %s", mask(a.UploadPath))
+
+	return sb.String()
+}
+
+type Client interface {
+	ApplyVolume(ctx context.Context, clusterID, dir string) (*ApplyVolumeResp, error)
+	Migrate(ctx context.Context, source Source, dest Destination) (string, error)
+}
+
+var _ Client = (*APIClient)(nil)
+
+type APIClient struct {
+	cli *req.Client
+
+	logger *zap.Logger
+}
+
+func NewClient(address, apikey string) *APIClient {
+	cli := req.C().
+		SetBaseURL(address).
+		SetCommonBearerAuthToken(apikey)
+	return &APIClient{cli: cli, logger: log.L()}
+}
+
+type applyVolumeReq struct {
+	ClusterID string `json:"clusterId"`
+	Path      string `json:"path"`
+}
+
+func (a *APIClient) checkResp(httpResp *req.Response, resp statusCoder, err error) error {
+	if err != nil {
+		return fmt.Errorf("cloud: send reqeust failed: %w", err)
+	}
+	if httpResp.IsErrorState() {
+		return fmt.Errorf("cloud: http resp code is error: %v", httpResp)
+	}
+	if resp.code() != 0 {
+		return fmt.Errorf("cloud: inner resp code is error: %v", resp)
+	}
+
+	return nil
+}
+
+func (a *APIClient) ApplyVolume(ctx context.Context, clusterID, dir string) (*ApplyVolumeResp, error) {
+	in := applyVolumeReq{ClusterID: clusterID, Path: dir}
+	a.logger.Debug("send apply volume request", zap.Any("request", in))
+
+	var applyResp common[ApplyVolumeResp]
+	resp, err := a.cli.R().
+		SetContext(ctx).
+		SetBody(in).
+		SetSuccessResult(&applyResp).
+		Post("/v2/volumes/apply")
+	a.logger.Debug("apply volume response", zap.String("response", applyResp.Data.String()))
+	if err := a.checkResp(resp, &applyResp, err); err != nil {
+		return nil, fmt.Errorf("cloud: apply volume: %w", err)
+	}
+
+	return &applyResp.Data, nil
+}
+
+type Source struct {
+	StageName string `json:"stageName"`
+	DataPath  string `json:"dataPath"`
+}
+
+type Destination struct {
+	ClusterID string `json:"clusterId"`
+}
+
+func (d *Destination) String() string {
+	return fmt.Sprintf("clusterId: %s", d.ClusterID)
+}
+
+type Migrate struct {
+	Source      Source      `json:"source"`
+	Destination Destination `json:"destination"`
+}
+
+type MigrateResp struct {
+	JobID string `json:"jobId"`
+}
+
+func (a *APIClient) Migrate(ctx context.Context, source Source, dest Destination) (string, error) {
+	in := Migrate{Source: source, Destination: dest}
+	a.logger.Debug("send migrate request", zap.Any("request", in))
+
+	var migrateResp common[MigrateResp]
+	resp, err := a.cli.R().
+		SetContext(ctx).
+		SetBody(in).
+		SetSuccessResult(&migrateResp).
+		Post("/v2/migrations/startByRemote")
+	a.logger.Debug("migrate response", zap.Any("response", resp))
+	if err := a.checkResp(resp, &migrateResp, err); err != nil {
+		return "", fmt.Errorf("cloud: start migrate job: %w", err)
+	}
+
+	return migrateResp.Data.JobID, nil
+}

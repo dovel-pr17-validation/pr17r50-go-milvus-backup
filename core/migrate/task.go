@@ -1,0 +1,318 @@
+package migrate
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	aws "github.com/aws/aws-sdk-go-v2/aws"
+	"go.uber.org/zap"
+	"golang.org/x/oauth2"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/zilliztech/milvus-backup/core/tasklet"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/client/cloud"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/storage"
+)
+
+var (
+	_ aws.CredentialsProvider = (*volume)(nil)
+	_ oauth2.TokenSource      = (*volume)(nil)
+)
+
+type volume struct {
+	clusterID string
+	prefix    string
+
+	cloudCli cloud.Client
+
+	currentResp struct {
+		mu         sync.RWMutex
+		expiration time.Time
+		resp       *cloud.ApplyVolumeResp
+	}
+
+	logger *zap.Logger
+}
+
+func newVolume(clusterID, prefix string, cloudCli cloud.Client) *volume {
+	return &volume{
+		clusterID: clusterID,
+		prefix:    prefix,
+
+		cloudCli: cloudCli,
+
+		logger: log.L().With(zap.String("cluster_id", clusterID), zap.String("prefix", prefix)),
+	}
+}
+
+func (v *volume) awsValue() aws.Credentials {
+	return aws.Credentials{
+		AccessKeyID:     v.currentResp.resp.Credentials.TmpAK,
+		SecretAccessKey: v.currentResp.resp.Credentials.TmpSK,
+		SessionToken:    v.currentResp.resp.Credentials.SessionToken,
+		CanExpire:       true,
+		Expires:         v.currentResp.expiration,
+	}
+}
+
+func (v *volume) oauth2Token() *oauth2.Token {
+	return &oauth2.Token{AccessToken: v.currentResp.resp.Credentials.SessionToken, Expiry: v.currentResp.expiration}
+}
+
+// Retrieve serves the S3 client a temporary volume credential, applying for a
+// fresh one through the cloud API when the cached one expired. The S3 signing
+// middleware calls it per operation; the cache below keeps that at one Apply
+// per expiry window.
+func (v *volume) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	v.logger.Debug("retrieve volume credential")
+	v.currentResp.mu.RLock()
+	if !v.IsExpired() {
+		v.logger.Debug("volume credential not expired, return cached credential")
+		v.currentResp.mu.RUnlock()
+		return v.awsValue(), nil
+	}
+	v.currentResp.mu.RUnlock()
+
+	// double check.
+	// maybe other thread has already applied for a new credential
+	v.currentResp.mu.Lock()
+	defer v.currentResp.mu.Unlock()
+	if !v.IsExpired() {
+		return v.awsValue(), nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	v.logger.Info("volume credential expired, apply new credential")
+	if err := v.apply(ctx); err != nil {
+		return aws.Credentials{}, err
+	}
+
+	return v.awsValue(), nil
+}
+
+func (v *volume) IsExpired() bool { return time.Now().After(v.currentResp.expiration) }
+
+func (v *volume) Token() (*oauth2.Token, error) {
+	v.logger.Debug("get volume token")
+
+	// first check if the token is still valid
+	v.currentResp.mu.RLock()
+	token := v.oauth2Token()
+	if token.Valid() {
+		v.currentResp.mu.RUnlock()
+		v.logger.Debug("volume token not expired, return cached token")
+		return token, nil
+	}
+	v.currentResp.mu.RUnlock()
+
+	// double check, maybe other thread has already applied for a new credential
+	v.currentResp.mu.Lock()
+	defer v.currentResp.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	token = v.oauth2Token()
+	if token.Valid() {
+		return token, nil
+	}
+
+	if err := v.apply(ctx); err != nil {
+		return nil, fmt.Errorf("migrate: get volume token %w", err)
+	}
+	v.logger.Debug("get volume token done")
+
+	return v.oauth2Token(), nil
+}
+
+func (v *volume) apply(ctx context.Context) error {
+	v.logger.Info("apply volume, it will take about 10 seconds")
+	start := time.Now()
+	resp, err := v.cloudCli.ApplyVolume(ctx, v.clusterID, v.prefix)
+	if err != nil {
+		return fmt.Errorf("migrate: apply volume %w", err)
+	}
+	v.logger.Info("apply volume done", zap.Duration("cost", time.Since(start)))
+
+	expiration, err := time.Parse(time.RFC3339, resp.Credentials.ExpireTime)
+	if err != nil {
+		return fmt.Errorf("migrate: parse expire time %w", err)
+	}
+
+	v.currentResp.resp = resp
+	v.currentResp.expiration = expiration
+
+	return nil
+}
+
+func newVolumeStorage(ctx context.Context, vol *volume) (storage.Client, error) {
+	var cred storage.Credential
+	switch vol.currentResp.resp.Cloud {
+	case cfg.ProviderGCP:
+		cred = storage.Credential{Type: storage.OAuth2TokenSource, OAuth2TokenSource: vol}
+	case cfg.ProviderAWS:
+		cred = storage.Credential{Type: storage.AWSCredProvider, AWSCredProvider: vol}
+	default:
+		return nil, fmt.Errorf("migrate: unsupported cloud provider %s", vol.currentResp.resp.Cloud)
+	}
+
+	storeCfg := storage.Config{
+		Provider:   vol.currentResp.resp.Cloud,
+		Endpoint:   vol.currentResp.resp.Endpoint,
+		UseSSL:     true,
+		Credential: cred,
+		Bucket:     vol.currentResp.resp.BucketName,
+	}
+
+	cli, err := storage.NewClient(ctx, storeCfg)
+	if err != nil {
+		return nil, fmt.Errorf("migrate: new volume storage %w", err)
+	}
+
+	return cli, nil
+}
+
+// Task executes one migrate run: it uploads one backup directory to the
+// cloud staging volume and triggers the cloud-side migrate job. It is not
+// the job: admission, registration, and the lifecycle states live one layer
+// up in app.MigrateJob, which drives Execute and records how it settles. The
+// tracker writes here are progress facts only.
+type Task struct {
+	logger *zap.Logger
+
+	cloudCli  cloud.Client
+	clusterID string
+
+	tracker *jobstate.MigrateTracker
+
+	backupDir     string
+	backupStorage storage.Client
+
+	volume  *volume
+	copySem *semaphore.Weighted
+}
+
+// TaskArgs carries the dependencies one migrate run needs. The caller
+// (app.MigrateJob) has already proved the backup meta is readable and
+// registered the job, so the tracker arrives minted.
+type TaskArgs struct {
+	TaskID        string
+	ClusterID     string
+	CloudCli      cloud.Client
+	BackupStorage storage.Client
+	BackupDir     string
+	Tracker       *jobstate.MigrateTracker
+	Concurrency   int
+}
+
+func NewTask(args TaskArgs) *Task {
+	return &Task{
+		logger: log.With(zap.String("task_id", args.TaskID)),
+
+		cloudCli:  args.CloudCli,
+		clusterID: args.ClusterID,
+
+		tracker: args.Tracker,
+
+		backupDir:     args.BackupDir,
+		backupStorage: args.BackupStorage,
+
+		// use taskID as volume prefix
+		volume:  newVolume(args.ClusterID, args.TaskID, args.CloudCli),
+		copySem: semaphore.NewWeighted(int64(args.Concurrency)),
+	}
+}
+
+func (t *Task) copyToCloud(ctx context.Context) error {
+	t.logger.Info("copy backup to cloud")
+
+	destCli, err := newVolumeStorage(ctx, t.volume)
+	if err != nil {
+		return fmt.Errorf("migrate: new volume storage %w", err)
+	}
+
+	srcPrefix := t.backupDir
+	destPrefix := t.volume.currentResp.resp.UploadPath
+	opt := storage.CopyPrefixOpt{
+		Src:        t.backupStorage,
+		Dest:       destCli,
+		SrcPrefix:  srcPrefix,
+		DestPrefix: destPrefix,
+		Sem:        t.copySem,
+
+		TraceFn: func(size int64) {
+			t.tracker.IncCopied(size)
+		},
+
+		Streaming: true,
+	}
+
+	copyTask := storage.NewCopyPrefixTask(opt)
+	if err := copyTask.Execute(ctx); err != nil {
+		return fmt.Errorf("migrate: copy to cloud %w", err)
+	}
+	t.logger.Info("copy backup to cloud done")
+
+	// The cloud staging volume only grants ListObject (no HeadObject/GetObject),
+	// so verify the copy with a single recursive list instead of per-object head.
+	if err := t.verifyCopyToCloud(ctx, destCli, srcPrefix, destPrefix); err != nil {
+		return fmt.Errorf("migrate: verify copy to cloud %w", err)
+	}
+	t.logger.Info("verify copy to cloud done")
+
+	return nil
+}
+
+func (t *Task) verifyCopyToCloud(ctx context.Context, destCli storage.Client, srcPrefix, destPrefix string) error {
+	expected, err := storage.ExpectedDestObjects(ctx, t.backupStorage, srcPrefix, destPrefix)
+	if err != nil {
+		return fmt.Errorf("migrate: build expected %w", err)
+	}
+
+	verifyTask := storage.NewVerifyPrefixTask(storage.VerifyPrefixOpt{
+		Cli:      destCli,
+		Prefix:   destPrefix,
+		Expected: expected,
+	})
+	return verifyTask.Execute(ctx)
+}
+
+func (t *Task) startMigrate(ctx context.Context) error {
+	src := cloud.Source{StageName: t.volume.currentResp.resp.VolumeName, DataPath: t.volume.prefix}
+
+	t.logger.Info("trigger migrate job")
+	dest := cloud.Destination{ClusterID: t.clusterID}
+	jobID, err := t.cloudCli.Migrate(ctx, src, dest)
+	if err != nil {
+		return fmt.Errorf("migrate: start migrate %w", err)
+	}
+	t.logger.Info("trigger migrate job done", zap.String("job_id", jobID))
+	t.tracker.SetJobID(jobID)
+
+	return nil
+}
+
+var _ tasklet.Tasklet = (*Task)(nil)
+
+func (t *Task) Execute(ctx context.Context) error {
+	if err := t.volume.apply(ctx); err != nil {
+		return fmt.Errorf("migrate: apply volume %w", err)
+	}
+
+	t.tracker.SetCopyStart()
+	if err := t.copyToCloud(ctx); err != nil {
+		return fmt.Errorf("migrate: copy to cloud %w", err)
+	}
+	t.tracker.SetCopyDone()
+
+	if err := t.startMigrate(ctx); err != nil {
+		return fmt.Errorf("migrate: start migrate %w", err)
+	}
+
+	return nil
+}

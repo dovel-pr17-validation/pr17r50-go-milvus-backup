@@ -1,0 +1,85 @@
+package backup
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"time"
+
+	"github.com/zilliztech/milvus-backup/internal/validate"
+)
+
+const _maxNameLength = 128
+
+func DefaultName(t time.Time) string {
+	datetime := t.UTC().Format("2006_01_02_15_04_05")
+	nanosecond := t.Nanosecond()
+	return fmt.Sprintf("backup_%s_%d", datetime, nanosecond)
+}
+
+func ValidateName(name string) error {
+	if validate.HasWhitespace(name) {
+		return errors.New("backup name should not contain whitespace")
+	}
+
+	if len(name) > _maxNameLength {
+		return fmt.Errorf("backup name length should not exceed %d", _maxNameLength)
+	}
+
+	firstRune := []rune(name)[0]
+	if firstRune != '_' && !validate.IsAlpha(firstRune) {
+		return errors.New("backup name should start with an underscore or letter")
+	}
+
+	if validate.HasSpecialChar(name) {
+		return errors.New("backup name should only contain numbers, letters and underscores")
+	}
+
+	return nil
+}
+
+var _strategyMap = map[string]Strategy{
+	"meta_only":    StrategyMetaOnly,
+	"skip_flush":   StrategySkipFlush,
+	"bulk_flush":   StrategyBulkFlush,
+	"serial_flush": StrategySerialFlush,
+}
+
+func SupportStrategy() []string { return slices.Sorted(maps.Keys(_strategyMap)) }
+
+func ParseStrategy(strategy string) (Strategy, error) {
+	if strategy == "" {
+		return StrategyAuto, nil
+	}
+
+	if strategy == "snapshot" {
+		return StrategyAuto, errors.New(`backup: "snapshot" is a format, not a strategy; use --format=snapshot instead`)
+	}
+
+	if s, ok := _strategyMap[strategy]; ok {
+		return s, nil
+	}
+
+	return StrategyAuto, fmt.Errorf("backup: invalid strategy %s", strategy)
+}
+
+var _formatMap = map[string]Format{
+	"auto":     FormatAuto,
+	"binlog":   FormatBinlog,
+	"snapshot": FormatSnapshot,
+}
+
+func SupportFormat() []string { return slices.Sorted(maps.Keys(_formatMap)) }
+
+func ParseFormat(format string) (Format, error) {
+	if format == "" {
+		return FormatAuto, nil
+	}
+
+	if f, ok := _formatMap[format]; ok {
+		return f, nil
+	}
+
+	return FormatAuto, fmt.Errorf("backup: invalid format %s", format)
+}

@@ -1,0 +1,94 @@
+package backup
+
+import (
+	"context"
+	"testing"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/zilliztech/milvus-backup/core/proto/backuppb"
+	"github.com/zilliztech/milvus-backup/internal/client/milvus"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+)
+
+func TestDatabaseTask_Execute(t *testing.T) {
+	t.Run("SupportDescribeDatabase", func(t *testing.T) {
+		cli := milvus.NewMockGrpc(t)
+		manage := milvus.NewMockManage(t)
+
+		cli.EXPECT().HasFeature(milvus.DescribeDatabase).Return(true).Once()
+		cli.EXPECT().DescribeDatabase(mock.Anything, "db1").Return(&milvuspb.DescribeDatabaseResponse{
+			DbID: 1,
+			Properties: []*commonpb.KeyValuePair{
+				{Key: "key1", Value: "value1"},
+				{Key: "key2", Value: "value2"},
+			},
+		}, nil).Once()
+
+		builder := newMetaBuilder("task1", "backup1")
+
+		task := newDatabaseTask("backup1", "db1", cli, manage, builder)
+		err := task.Execute(context.Background())
+		assert.NoError(t, err)
+
+		assert.Equal(t, int64(1), builder.data.DatabaseBackups[0].GetDbId())
+		assert.Equal(t, "db1", builder.data.DatabaseBackups[0].GetDbName())
+		assert.Equal(t, 2, len(builder.data.DatabaseBackups[0].GetProperties()))
+	})
+
+	t.Run("NotSupportDescribeDatabase", func(t *testing.T) {
+		cli := milvus.NewMockGrpc(t)
+		manage := milvus.NewMockManage(t)
+
+		cli.EXPECT().HasFeature(milvus.DescribeDatabase).Return(false).Once()
+
+		builder := newMetaBuilder("task1", "backup1")
+
+		task := newDatabaseTask("backup1", collref.DefaultDBName, cli, manage, builder)
+		err := task.Execute(context.Background())
+		assert.NoError(t, err)
+
+		assert.Equal(t, int64(0), builder.data.DatabaseBackups[0].GetDbId())
+		assert.Equal(t, collref.DefaultDBName, builder.data.DatabaseBackups[0].GetDbName())
+		assert.Empty(t, builder.data.DatabaseBackups[0].GetProperties())
+	})
+}
+
+func TestDatabaseTask_cipherEnabled(t *testing.T) {
+	task := &databaseTask{}
+
+	t.Run("BothExist", func(t *testing.T) {
+		assert.True(t, task.cipherEnabled([]*backuppb.KeyValuePair{
+			{Key: _cipherEzIDKey, Value: "ez123"},
+			{Key: _cipherKeyKey, Value: "key456"},
+		}))
+	})
+
+	t.Run("OnlyEzID", func(t *testing.T) {
+		assert.False(t, task.cipherEnabled([]*backuppb.KeyValuePair{
+			{Key: _cipherEzIDKey, Value: "ez123"},
+		}))
+	})
+
+	t.Run("OnlyKey", func(t *testing.T) {
+		assert.False(t, task.cipherEnabled([]*backuppb.KeyValuePair{
+			{Key: _cipherKeyKey, Value: "key456"},
+		}))
+	})
+
+	t.Run("BothEmpty", func(t *testing.T) {
+		assert.False(t, task.cipherEnabled([]*backuppb.KeyValuePair{
+			{Key: _cipherEzIDKey, Value: ""},
+			{Key: _cipherKeyKey, Value: ""},
+		}))
+	})
+
+	t.Run("NotSet", func(t *testing.T) {
+		assert.False(t, task.cipherEnabled([]*backuppb.KeyValuePair{
+			{Key: "other", Value: "true"},
+		}))
+	})
+}

@@ -1,0 +1,15 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+    patch:
+      default:
+        target: 80%
+
+ignore:
+  - "**/*.py"
+  - "**/*.sh"
+  - "**/*.pb.go"
+  - "**/*_mock.go"
+  - "**/*_string.go"

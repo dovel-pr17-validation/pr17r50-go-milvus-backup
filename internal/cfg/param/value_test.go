@@ -1,0 +1,51 @@
+package param
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestMaskSecret(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"Empty", "", ""},
+		{"Short1Char", "a", "****"},
+		{"Short2Chars", "ab", "****"},
+		{"Short3Chars", "abc", "****"},
+		{"Short4Chars", "abcd", "****"},
+		{"5Chars", "abcde", "****"},
+		{"6Chars", "abcdef", "****"},
+		{"10Chars", "0123456789", "****"},
+		{"Password", "minioadmin", "****"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := maskSecret(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestValueDisplay(t *testing.T) {
+	t.Run("NonSecretValue", func(t *testing.T) {
+		v := Value[string]{Val: "localhost", Used: Used{Kind: SourceDefault}}
+		entry := v.Display("Milvus.Address")
+
+		assert.Equal(t, "Milvus.Address", entry.Name)
+		assert.Equal(t, "localhost", entry.Value)
+	})
+
+	t.Run("SecretValueIsMasked", func(t *testing.T) {
+		v := Value[string]{Val: "supersecret", Opts: SecretValue, Used: Used{Kind: SourceConfigFile, Key: "password"}}
+		entry := v.Display("Milvus.Password")
+
+		assert.NotEqual(t, "supersecret", entry.Value, "secret value should be masked")
+		// a set secret renders as a fixed mask; no value characters show
+		assert.Equal(t, "****", entry.Value)
+	})
+}

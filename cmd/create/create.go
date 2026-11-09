@@ -1,0 +1,244 @@
+package create
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
+	"github.com/zilliztech/milvus-backup/app"
+	"github.com/zilliztech/milvus-backup/cmd/flags"
+	"github.com/zilliztech/milvus-backup/cmd/root"
+	"github.com/zilliztech/milvus-backup/core/backup"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/filter"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+	"github.com/zilliztech/milvus-backup/internal/progressbar"
+)
+
+// removedFlags are the create flags dropped in 0.6, after 0.5 accepted them with
+// a deprecation warning.
+var removedFlags = []flags.Removed{
+	{Name: "colls", Shorthand: "c", Advice: "use --filter instead"},
+	{Name: "databases", Shorthand: "d", Advice: "use --filter instead"},
+	{Name: "database_collections", Shorthand: "a", Advice: "use --filter instead"},
+	{Name: "force", Shorthand: "f", NoValue: true, Advice: "use --strategy=skip_flush instead"},
+	{Name: "meta_only", NoValue: true, Advice: "use --strategy=meta_only instead"},
+}
+
+type options struct {
+	backupName string
+
+	filter string
+
+	strategy string
+
+	format string
+
+	backupIndexExtra bool
+
+	rbac bool
+
+	dropSnapshotIfExists bool
+
+	forPreset string
+}
+
+func (o *options) validate() error {
+	if len(o.backupName) != 0 && backup.ValidateName(o.backupName) != nil {
+		return fmt.Errorf("invalid backup name %s", o.backupName)
+	}
+
+	if _, err := backup.ParseStrategy(o.strategy); err != nil {
+		return fmt.Errorf("invalid strategy %s, only support %s", o.strategy, strings.Join(backup.SupportStrategy(), ","))
+	}
+
+	if _, err := backup.ParseFormat(o.format); err != nil {
+		return fmt.Errorf("invalid format %s, only support %s", o.format, strings.Join(backup.SupportFormat(), ","))
+	}
+
+	// Surface an unknown purpose here, before storage clients are built from the
+	// config: a flag-level mistake should not need a reachable cluster to be
+	// reported. toOption applies the same expansion for real.
+	if err := expandPreset(o.forPreset, &backup.Option{}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (o *options) complete() error {
+	if o.backupName == "" {
+		o.backupName = backup.DefaultName(time.Now())
+	}
+
+	return nil
+}
+
+func (o *options) addFlags(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&o.backupName, "name", "n", "", "backup name, if unset will generate a name automatically")
+
+	cmd.Flags().StringVarP(&o.filter, "filter", "", "", "specify which collections to backup, if not set, backup all collections. example: db1.coll1,db2.col1")
+
+	cmd.Flags().StringVarP(&o.strategy, "strategy", "", "", "backup strategy, one of [meta_only, skip_flush, bulk_flush, serial_flush], if not set will auto select")
+
+	cmd.Flags().StringVarP(&o.format, "format", "", "", "backup format, one of [auto, binlog, snapshot], if not set will auto select")
+
+	cmd.Flags().BoolVarP(&o.backupIndexExtra, "backup_index_extra", "", false, "whether backup index extra info")
+
+	cmd.Flags().BoolVarP(&o.rbac, "rbac", "", false, "whether backup RBAC meta")
+
+	cmd.Flags().BoolVarP(&o.dropSnapshotIfExists, "drop_snapshot_if_exists", "", false, "drop a snapshot of the same name before creating the backup's own snapshot, to clear a leftover from an earlier run that died mid-flight; snapshot format only")
+
+	cmd.Flags().StringVarP(&o.forPreset, "for", "", "", "purpose preset, one of [archive, clone, secondary]: forces the option values the matching restore path requires, overriding conflicting flags")
+
+	flags.AddRemoved(cmd, removedFlags)
+}
+
+func (o *options) toFilter() (filter.Filter, error) {
+	if o.filter == "" {
+		return filter.Filter{}, nil
+	}
+
+	f, err := filter.Parse(o.filter)
+	if err != nil {
+		return filter.Filter{}, fmt.Errorf("parse filter: %w", err)
+	}
+
+	return f, nil
+}
+
+// toOption parses the flags into the transport-neutral request option. The
+// strategy and format are already validated in validate().
+func (o *options) toOption(params *cfg.Config) (backup.Option, error) {
+	f, err := o.toFilter()
+	if err != nil {
+		return backup.Option{}, err
+	}
+
+	strategy, err := backup.ParseStrategy(o.strategy)
+	if err != nil {
+		return backup.Option{}, err
+	}
+
+	format, err := backup.ParseFormat(o.format)
+	if err != nil {
+		return backup.Option{}, err
+	}
+
+	option := backup.Option{
+		BackupName: o.backupName,
+		PauseGC:    params.Backup.PauseGC.Val,
+
+		Strategy: strategy,
+
+		Format: format,
+
+		BackupRBAC: o.rbac,
+
+		BackupIndexExtra: o.backupIndexExtra,
+
+		DropSnapshotIfExists: o.dropSnapshotIfExists,
+
+		Filter: f,
+	}
+
+	if err := expandPreset(o.forPreset, &option); err != nil {
+		return backup.Option{}, err
+	}
+
+	return option, nil
+}
+
+func (o *options) run(cmd *cobra.Command, params *cfg.Config) error {
+	start := time.Now()
+
+	ctx := context.Background()
+
+	opt, err := o.toOption(params)
+	if err != nil {
+		return fmt.Errorf("create: build option: %w", err)
+	}
+
+	if summary := presetSummary(o.forPreset, opt); summary != "" {
+		cmd.Println(summary)
+	}
+
+	store := jobstate.Default()
+	taskID := uuid.NewString()
+	job, err := app.NewBackupJob(ctx, params, store, app.CreateBackupRequest{
+		TaskID: taskID,
+		Option: opt,
+	})
+	if err != nil {
+		return fmt.Errorf("create: new backup job: %w", err)
+	}
+
+	// The CLI exposes no async form: the job runs detached and the command
+	// waits on it. On a terminal it renders progress from job-store
+	// snapshots; piped output keeps the old plain behavior, so scripts and
+	// CI logs never see bar frames.
+	job.Run(ctx)
+
+	var status jobstate.BackupStatus
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		p := progressbar.Progress()
+		status, err = renderBackup(ctx, p, store, taskID, 200*time.Millisecond, params.Backup.Concurrency.Collections.Val)
+		// mpb buffers intercepted writes and the bars' last frames until the
+		// container shuts down, so the Wait must precede any plain output.
+		p.Wait()
+	} else {
+		status, err = job.Wait(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("create: wait backup job: %w", err)
+	}
+	if status.State == jobstate.BackupStateFail {
+		return fmt.Errorf("create: run backup job: %s", status.ErrorMessage)
+	}
+
+	cmd.Println("create backup success")
+	duration := time.Since(start)
+	cmd.Println(fmt.Sprintf("duration:%.2f s", duration.Seconds()))
+
+	return nil
+}
+
+func NewCmd(opt *root.Options) *cobra.Command {
+	var o options
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "create a backup",
+
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := flags.CheckRemoved(cmd, removedFlags); err != nil {
+				return err
+			}
+
+			params := opt.InitGlobalVars()
+
+			if err := o.complete(); err != nil {
+				return err
+			}
+
+			if err := o.validate(); err != nil {
+				return err
+			}
+
+			err := o.run(cmd, params)
+			cobra.CheckErr(err)
+
+			return nil
+		},
+	}
+
+	o.addFlags(cmd)
+
+	return cmd
+}

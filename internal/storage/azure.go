@@ -1,0 +1,518 @@
+package storage
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"iter"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/retry"
+)
+
+var _ Client = (*AzureClient)(nil)
+var _ batchDeleter = (*AzureClient)(nil)
+
+func newAzureClient(cfg Config) (*AzureClient, error) {
+	// backwards compatible, don't know why we kept the "blob" in the code instead of letting it be input externally.
+	// Remove standard HTTPS port :443 from endpoint if present
+	endpoint := strings.TrimSuffix(cfg.Endpoint, ":443")
+	ep := fmt.Sprintf("https://%s.blob.%s", cfg.Credential.AzureAccountName, endpoint)
+	logger := log.L().With(zap.String("provider", cfg.Provider), zap.String("endpoint", endpoint))
+
+	// Both clients must carry the transport: sasCli mints the SAS tokens the
+	// copy path uses, so a connection it can make but cli cannot is useless.
+	var blobOpts *azblob.ClientOptions
+	var svcOpts *service.ClientOptions
+	if cfg.CACertPath != "" {
+		tr, err := tlsTransport(cfg.CACertPath)
+		if err != nil {
+			return nil, err
+		}
+		// azcore's Transporter wants a Do method, so the transport rides in
+		// an http.Client the way the SDK's own default transport does.
+		blobOpts = &azblob.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: tr}}}
+		svcOpts = &service.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: tr}}}
+	}
+
+	switch cfg.Credential.Type {
+	case IAM:
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure default credential: %w", err)
+		}
+		cli, err := azblob.NewClient(ep, cred, blobOpts)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure client: %w", err)
+		}
+		sasCli, err := service.NewClient(ep, cred, svcOpts)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure service client: %w", err)
+		}
+
+		return &AzureClient{cfg: cfg, cli: cli, sasCli: sasCli, logger: logger}, nil
+	case Static:
+		cred, err := azblob.NewSharedKeyCredential(cfg.Credential.AK, cfg.Credential.SK)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure shared key credential: %w", err)
+		}
+		cli, err := azblob.NewClientWithSharedKeyCredential(ep, cred, blobOpts)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure client: %w", err)
+		}
+		sasCli, err := service.NewClientWithSharedKeyCredential(ep, cred, svcOpts)
+		if err != nil {
+			return nil, fmt.Errorf("storage: new azure service client: %w", err)
+		}
+		return &AzureClient{cfg: cfg, cli: cli, sasCli: sasCli, logger: logger}, nil
+	default:
+		return nil, fmt.Errorf("storage: azure unsupported credential type: %s", cfg.Credential.Type.String())
+	}
+}
+
+type AzureClient struct {
+	cfg Config
+
+	cli *azblob.Client
+
+	// sasCli is used to generate SAS token.
+	// When we want to copy object under two different service accounts, AD auth is not supported.
+	// So we need to use AD auth to generate SAS token and use SAS token to copy object.
+	sasCli *service.Client
+
+	logger *zap.Logger
+}
+
+func (a *AzureClient) getSAS(ctx context.Context, srcCli *AzureClient) (*sas.QueryParameters, error) {
+	if srcCli.cfg.Credential.Type == IAM {
+		return a.getSASByUserDelegation(ctx, srcCli)
+	}
+	return a.getSASBySharedKeyCredential(srcCli)
+}
+
+func (a *AzureClient) getSASBySharedKeyCredential(srcCli *AzureClient) (*sas.QueryParameters, error) {
+	credential, err := azblob.NewSharedKeyCredential(srcCli.cfg.Credential.AK, srcCli.cfg.Credential.SK)
+	if err != nil {
+		return nil, fmt.Errorf("storage: azure create shared key credential: %w", err)
+	}
+
+	sasQueryParams, err := sas.AccountSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		ExpiryTime:    time.Now().Add(48 * time.Hour),
+		Permissions:   new(sas.AccountPermissions{Read: true, List: true}).String(),
+		ResourceTypes: new(sas.AccountResourceTypes{Container: true, Object: true}).String(),
+	}.SignWithSharedKey(credential)
+
+	if err != nil {
+		return nil, fmt.Errorf("storage: azure sign sas with shared key: %w", err)
+	}
+
+	return &sasQueryParams, nil
+}
+
+func (a *AzureClient) getSASByUserDelegation(ctx context.Context, srcCli *AzureClient) (*sas.QueryParameters, error) {
+	// Set current and pastime and create key
+	now := time.Now().Add(-10 * time.Second)
+	expiry := now.Add(48 * time.Hour)
+	info := service.KeyInfo{
+		Start:  new(now.Format(sas.TimeFormat)),
+		Expiry: new(expiry.Format(sas.TimeFormat)),
+	}
+	udc, err := srcCli.sasCli.GetUserDelegationCredential(ctx, info, nil)
+	if err != nil {
+		return nil, fmt.Errorf("storage: azure get user delegation credential: %w", err)
+	}
+	// Create Blob Signature Values with desired permissions and sign with user delegation credential
+	sasQueryParams, err := sas.BlobSignatureValues{
+		Protocol:      sas.ProtocolHTTPS,
+		StartTime:     now,
+		ExpiryTime:    expiry,
+		Permissions:   new(sas.ContainerPermissions{Read: true, List: true}).String(),
+		ContainerName: srcCli.cfg.Bucket,
+	}.SignWithUserDelegation(udc)
+	if err != nil {
+		return nil, fmt.Errorf("storage: azure sign with user delegation: %w", err)
+	}
+	return &sasQueryParams, nil
+}
+
+func (a *AzureClient) Config() Config { return a.cfg }
+
+func (a *AzureClient) CopyObject(ctx context.Context, i CopyObjectInput) error {
+	srcCli, ok := i.SrcCli.(*AzureClient)
+	if !ok {
+		return fmt.Errorf("storage: azure copy object src client is not azure")
+	}
+
+	threshold := a.multipartCopyThreshold()
+	if i.SrcAttr.Length >= threshold {
+		a.logger.Debug("copy object by multipart", zap.String("src_key", i.SrcAttr.Key), zap.String("dest_key", i.DestKey))
+		return a.multiPartCopy(ctx, srcCli, i)
+	}
+
+	a.logger.Debug("copy object by single part", zap.String("src_key", i.SrcAttr.Key), zap.String("dest_key", i.DestKey))
+	return a.copyObject(ctx, srcCli, i)
+}
+
+const _azureMaxSyncCopySize int64 = 256 * _MiB
+
+func (a *AzureClient) multipartCopyThreshold() int64 {
+	if a.cfg.MultipartCopyThresholdMiB > 0 {
+		threshold := a.cfg.MultipartCopyThresholdMiB * _MiB
+		// Azure CopyFromURL (synchronous copy) has a 256 MB limit,
+		// so we cap the threshold to avoid errors
+		if threshold > _azureMaxSyncCopySize {
+			return _azureMaxSyncCopySize
+		}
+		return threshold
+	}
+	return _azureMaxSyncCopySize
+}
+
+func (a *AzureClient) copyObject(ctx context.Context, srcCli *AzureClient, i CopyObjectInput) error {
+	return retry.Do(ctx, func() error {
+		// Remove standard HTTPS port :443 from endpoint if present
+		endpoint := strings.TrimSuffix(srcCli.cfg.Endpoint, ":443")
+		srcURL := fmt.Sprintf("https://%s.blob.%s/%s/%s", srcCli.cfg.Credential.AzureAccountName, endpoint, srcCli.cfg.Bucket, i.SrcAttr.Key)
+		// Azure CopyFromURL always requires authentication for the source URL, even for same account
+		// Generate SAS token for source URL
+		srcSAS, err := a.getSAS(ctx, srcCli)
+		if err != nil {
+			return err
+		}
+		srcURL += "?" + srcSAS.Encode()
+
+		blobCli := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).NewBlockBlobClient(i.DestKey)
+		// we need to abort the previous copy operation before copy from url
+		abortErr := func() error {
+			blobProperties, err := blobCli.BlobClient().GetProperties(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("storage: azure get properties: %w", err)
+			}
+			if blobProperties.CopyID != nil {
+				if _, err = blobCli.AbortCopyFromURL(ctx, *blobProperties.CopyID, nil); err != nil {
+					return fmt.Errorf("storage: azure abort copy from url: %w", err)
+				}
+			}
+			return nil
+		}()
+
+		if _, err := blobCli.CopyFromURL(ctx, srcURL, nil); err != nil {
+			// abortErr is nil when the blob had no previous copy to abort, and
+			// a nil %w renders as "%!w(<nil>)", so wrap it only when set.
+			if abortErr != nil {
+				return fmt.Errorf("storage: azure copy from url: %w, abort previous copy: %w", err, abortErr)
+			}
+			return fmt.Errorf("storage: azure copy from url: %w", err)
+		}
+
+		return nil
+	})
+}
+
+type azureBlockInfo struct {
+	blockID string
+	index   int
+}
+
+func (a *AzureClient) multiPartCopy(ctx context.Context, srcCli *AzureClient, i CopyObjectInput) error {
+	parts, err := splitIntoParts(i.SrcAttr.Length)
+	if err != nil {
+		return fmt.Errorf("storage: azure split into parts: %w", err)
+	}
+
+	// Generate SAS token for source URL
+	endpoint := strings.TrimSuffix(srcCli.cfg.Endpoint, ":443")
+	srcBaseURL := fmt.Sprintf("https://%s.blob.%s/%s/%s", srcCli.cfg.Credential.AzureAccountName, endpoint, srcCli.cfg.Bucket, i.SrcAttr.Key)
+	srcSAS, err := a.getSAS(ctx, srcCli)
+	if err != nil {
+		return fmt.Errorf("storage: azure get sas: %w", err)
+	}
+	srcURL := srcBaseURL + "?" + srcSAS.Encode()
+
+	blobCli := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).NewBlockBlobClient(i.DestKey)
+
+	blockInfos := make([]azureBlockInfo, 0, len(parts))
+	var mu sync.Mutex
+	g, subCtx := errgroup.WithContext(ctx)
+	g.SetLimit(_maxCopyPartParallelism)
+
+	for _, p := range parts {
+		g.Go(func() error {
+			// Block ID must be base64 encoded and all block IDs must have the same length
+			blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("block-%08d", p.Index)))
+
+			a.logger.Debug("stage block from url",
+				zap.String("dest_key", i.DestKey),
+				zap.String("block_id", blockID),
+				zap.Int("index", p.Index),
+				zap.Int64("offset", p.Offset),
+				zap.Int64("size", p.Size))
+
+			err := retry.Do(subCtx, func() error {
+				_, err := blobCli.StageBlockFromURL(subCtx, blockID, srcURL, &blockblob.StageBlockFromURLOptions{
+					Range: azblob.HTTPRange{Offset: p.Offset, Count: p.Size},
+				})
+				if err != nil {
+					return fmt.Errorf("storage: azure stage block from url: %w", err)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			blockInfos = append(blockInfos, azureBlockInfo{blockID: blockID, index: p.Index})
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("storage: azure wait for stage block: %w", err)
+	}
+
+	// Sort block IDs by index to maintain order
+	sort.Slice(blockInfos, func(i, j int) bool {
+		return blockInfos[i].index < blockInfos[j].index
+	})
+
+	blockIDs := make([]string, len(blockInfos))
+	for i, info := range blockInfos {
+		blockIDs[i] = info.blockID
+	}
+
+	// Commit all blocks
+	_, err = blobCli.CommitBlockList(ctx, blockIDs, nil)
+	if err != nil {
+		return fmt.Errorf("storage: azure commit block list: %w", err)
+	}
+
+	return nil
+}
+
+func (a *AzureClient) HeadObject(ctx context.Context, key string) (ObjectAttr, error) {
+	resp, err := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).NewBlobClient(key).
+		GetProperties(ctx, nil)
+	if err != nil {
+		return ObjectAttr{}, fmt.Errorf("storage: azure get properties: %w", err)
+	}
+
+	return ObjectAttr{Key: key, Length: *resp.ContentLength}, nil
+}
+
+func (a *AzureClient) GetObject(ctx context.Context, key string) (*Object, error) {
+	blobCli := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).NewBlockBlobClient(key)
+	resp, err := blobCli.DownloadStream(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("storage: azure download stream: %w", err)
+	}
+
+	return &Object{
+		Length: *resp.ContentLength,
+		// NewRetryReader re-issues a ranged request from the current offset if the
+		// stream breaks mid-read, instead of surfacing a partial-failure to callers.
+		Body: resp.NewRetryReader(ctx, nil),
+	}, nil
+}
+
+func (a *AzureClient) UploadObject(ctx context.Context, i UploadObjectInput) error {
+	if _, err := a.cli.UploadStream(ctx, a.cfg.Bucket, i.Key, i.Body, nil); err != nil {
+		return fmt.Errorf("storage: azure upload stream: %w", err)
+	}
+
+	return nil
+}
+
+// iteratePager drives the Azure pager API as a sequence. It fetches one page
+// at a time and yields the page's entries; a NextPage error is yielded and
+// stops the sequence. Both flat (recursive) and hierarchy (delimiter)
+// listings share this logic, differing only in the pager type and how a page
+// is converted to ObjectAttr entries.
+//
+// Notice: the first call to `pager.More()` returns `true` even if the current
+// prefix has no content, and ListBlobs* can yield empty pages (no blobs and
+// no prefixes), so the loop keeps fetching until a page yields an entry or
+// the pager is exhausted.
+func iteratePager[T any](ctx context.Context, yield func(ObjectAttr, error) bool, pager *runtime.Pager[T], toAttrs func(T) []ObjectAttr) {
+	for {
+		if !pager.More() {
+			return
+		}
+
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			yield(ObjectAttr{}, fmt.Errorf("storage: azure list prefix: %w", err))
+			return
+		}
+
+		for _, attr := range toAttrs(page) {
+			if !yield(attr, nil) {
+				return
+			}
+		}
+	}
+}
+
+// NewObjectIter constructs the pager lazily inside the sequence, so no
+// request is made until the range starts. The pager fetches pages
+// synchronously and keeps no background goroutine.
+func (a *AzureClient) NewObjectIter(ctx context.Context, prefix string, recursive bool) iter.Seq2[ObjectAttr, error] {
+	return func(yield func(ObjectAttr, error) bool) {
+		if recursive {
+			pager := a.cli.NewListBlobsFlatPager(a.cfg.Bucket, &azblob.ListBlobsFlatOptions{Prefix: new(prefix)})
+			iteratePager(ctx, yield, pager, func(page azblob.ListBlobsFlatResponse) []ObjectAttr {
+				attrs := make([]ObjectAttr, 0, len(page.Segment.BlobItems))
+				for _, blob := range page.Segment.BlobItems {
+					attrs = append(attrs, ObjectAttr{Key: *blob.Name, Length: *blob.Properties.ContentLength})
+				}
+				return attrs
+			})
+			return
+		}
+
+		pager := a.cli.ServiceClient().
+			NewContainerClient(a.cfg.Bucket).
+			NewListBlobsHierarchyPager("/", &container.ListBlobsHierarchyOptions{Prefix: new(prefix)})
+		iteratePager(ctx, yield, pager, func(page container.ListBlobsHierarchyResponse) []ObjectAttr {
+			attrs := make([]ObjectAttr, 0, len(page.Segment.BlobItems)+len(page.Segment.BlobPrefixes))
+			for _, blob := range page.Segment.BlobItems {
+				attrs = append(attrs, ObjectAttr{Key: *blob.Name, Length: *blob.Properties.ContentLength})
+			}
+			for _, prefix := range page.Segment.BlobPrefixes {
+				attrs = append(attrs, ObjectAttr{Key: *prefix.Name})
+			}
+			return attrs
+		})
+	}
+}
+
+func (a *AzureClient) DeleteObject(ctx context.Context, key string) error {
+	if _, err := a.cli.DeleteBlob(ctx, a.cfg.Bucket, key, nil); err != nil {
+		return fmt.Errorf("storage: azure delete blob: %w", err)
+	}
+
+	return nil
+}
+
+// Azure Blob Batch takes at most 256 sub-requests per call.
+const _azureDeleteObjectsBatchSize = 256
+
+func (a *AzureClient) DeleteObjectsBatchSize() int { return _azureDeleteObjectsBatchSize }
+
+// DeleteObjects deletes a batch of keys with one Blob Batch request
+// (POST ?restype=container&comp=batch). A key already gone counts as
+// deleted, so a per-key failure inside the 202 response is retried as the
+// whole batch without the already-deleted keys failing the retry.
+func (a *AzureClient) DeleteObjects(ctx context.Context, keys []string) error {
+	return retry.Do(ctx, func() error {
+		err := a.deleteObjects(ctx, keys)
+		if isAzureBatchDeleteUnsupported(err) {
+			// A backend without Blob Batch (an emulator on an old API
+			// version) will never learn it, so skip the retries and tell
+			// DeleteWithCallback to degrade to per-key deletion.
+			return retry.Unrecoverable(fmt.Errorf("%w: %w", errBatchDeleteUnsupported, err))
+		}
+		return err
+	})
+}
+
+func (a *AzureClient) deleteObjects(ctx context.Context, keys []string) error {
+	containerCli := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket)
+	bb, err := containerCli.NewBatchBuilder()
+	if err != nil {
+		return fmt.Errorf("storage: azure new batch builder: %w", err)
+	}
+	for _, key := range keys {
+		if err := bb.Delete(key, nil); err != nil {
+			return fmt.Errorf("storage: azure add delete sub-request for %s: %w", key, err)
+		}
+	}
+
+	resp, err := containerCli.SubmitBatch(ctx, bb, nil)
+	if err != nil {
+		return fmt.Errorf("storage: azure submit batch: %w", err)
+	}
+
+	var errs []error
+	for _, item := range resp.Responses {
+		if item.Error == nil || isBlobNotFound(item.Error) {
+			continue
+		}
+		errs = append(errs, fmt.Errorf("storage: azure delete object %s: %w", lo.FromPtr(item.BlobName), item.Error))
+	}
+
+	return errors.Join(errs...)
+}
+
+// isBlobNotFound reports whether err is a BlobNotFound rejection, from either
+// a single DeleteBlob or one sub-response of a Blob Batch.
+func isBlobNotFound(err error) bool {
+	var azErr *azcore.ResponseError
+	if errors.As(err, &azErr) {
+		return azErr.ErrorCode == string(bloberror.BlobNotFound)
+	}
+	return false
+}
+
+// isAzureBatchDeleteUnsupported reports whether err is a NotImplemented
+// rejection of the Blob Batch request itself, the answer an Azure-compatible
+// endpoint without Blob Batch gives. Per-key failures decoded from a 202
+// response never reach here: SubmitBatch returns them on the response, not
+// as the error.
+func isAzureBatchDeleteUnsupported(err error) bool {
+	var azErr *azcore.ResponseError
+	if errors.As(err, &azErr) {
+		return azErr.StatusCode == http.StatusNotImplemented
+	}
+	return false
+}
+
+func (a *AzureClient) BucketExist(ctx context.Context, _ string) (bool, error) {
+	_, err := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).
+		GetProperties(ctx, &container.GetPropertiesOptions{})
+
+	if err != nil {
+		var azErr *azcore.ResponseError
+		ok := errors.As(err, &azErr)
+		if !ok {
+			return false, fmt.Errorf("storage: azure get container properties: %w", err)
+		}
+
+		if azErr.ErrorCode == string(bloberror.ContainerNotFound) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (a *AzureClient) CreateBucket(ctx context.Context) error {
+	_, err := a.cli.ServiceClient().NewContainerClient(a.cfg.Bucket).Create(ctx, &azblob.CreateContainerOptions{})
+	if err != nil {
+		return fmt.Errorf("storage: azure create container: %w", err)
+	}
+
+	return nil
+}

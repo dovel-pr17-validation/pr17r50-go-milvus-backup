@@ -1,0 +1,894 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zilliztech/milvus-backup/app"
+	"github.com/zilliztech/milvus-backup/core/apiv1"
+	"github.com/zilliztech/milvus-backup/core/proto/backuppb"
+	"github.com/zilliztech/milvus-backup/core/restore"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+	"github.com/zilliztech/milvus-backup/internal/filter"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+)
+
+func TestValidateRestoreRequest(t *testing.T) {
+	t.Run("Valid", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup"}
+		assert.NoError(t, validateRestoreRequest(request))
+	})
+
+	t.Run("BackupNameEmpty", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("DropAndNotCreate", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", DropExistCollection: true, SkipCreateCollection: true}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("RestorePlanAndCollectionSuffix", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", RestorePlan: &apiv1.RestorePlan{}, CollectionSuffix: "_suffix"}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("RestorePlanAndCollectionRenames", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", RestorePlan: &apiv1.RestorePlan{}, CollectionRenames: map[string]string{"db1.coll1": "db2.coll2"}}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("InvalidCollectionSuffix", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", CollectionSuffix: "invalid-suffix"}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("InvalidStrategy", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", Strategy: "invalid"}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+
+	t.Run("ValidStrategy", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", Strategy: "merged_seg"}
+		assert.NoError(t, validateRestoreRequest(request))
+	})
+
+	t.Run("ValidSecondaries", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", Secondaries: []apiv1.Secondary{
+			{Address: "http://10.0.0.2:19530", Token: "user:password"},
+			{Address: "http://10.0.0.3:19530"},
+		}}
+		assert.NoError(t, validateRestoreRequest(request))
+	})
+
+	t.Run("InvalidSecondary", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{BackupName: "backup", Secondaries: []apiv1.Secondary{{Address: "10.0.0.2:19530"}}}
+		assert.Error(t, validateRestoreRequest(request))
+	})
+}
+
+// The deprecated use_v2_restore bool survives as a fallback for old callers:
+// true maps to merged_seg, and an explicit strategy wins over it. The bool
+// arrives inside the request's JSON body in production, so the tests set it
+// the same way, which also keeps the deprecated field's name out of this code.
+func TestToRestoreStrategy(t *testing.T) {
+	newRequest := func(t *testing.T, body string) *apiv1.RestoreBackupRequest {
+		t.Helper()
+
+		var request apiv1.RestoreBackupRequest
+		require.NoError(t, json.Unmarshal([]byte(body), &request))
+		return &request
+	}
+
+	t.Run("ExplicitStrategyWins", func(t *testing.T) {
+		request := newRequest(t, `{"strategy": "per_seg", "useV2Restore": true}`)
+		strategy, err := toRestoreStrategy(request)
+		assert.NoError(t, err)
+		assert.Equal(t, restore.StrategyPerSeg, strategy)
+	})
+
+	t.Run("ExplicitAutoWinsOverDeprecatedBool", func(t *testing.T) {
+		request := newRequest(t, `{"strategy": "auto", "useV2Restore": true}`)
+		strategy, err := toRestoreStrategy(request)
+		assert.NoError(t, err)
+		assert.Equal(t, restore.StrategyAuto, strategy)
+	})
+
+	t.Run("DeprecatedBoolMapsToMergedSeg", func(t *testing.T) {
+		request := newRequest(t, `{"useV2Restore": true}`)
+		strategy, err := toRestoreStrategy(request)
+		assert.NoError(t, err)
+		assert.Equal(t, restore.StrategyMergedSeg, strategy)
+	})
+
+	t.Run("NeitherSetIsAuto", func(t *testing.T) {
+		request := newRequest(t, `{}`)
+		strategy, err := toRestoreStrategy(request)
+		assert.NoError(t, err)
+		assert.Equal(t, restore.StrategyAuto, strategy)
+	})
+
+	t.Run("InvalidStrategy", func(t *testing.T) {
+		request := newRequest(t, `{"strategy": "invalid"}`)
+		_, err := toRestoreStrategy(request)
+		assert.Error(t, err)
+	})
+}
+
+func TestNewTableMapperFromCollRename(t *testing.T) {
+	r, err := newTableMapperFromCollRename(map[string]string{
+		"db1.*":     "db2.*",
+		"db1.coll1": "db2.coll2",
+		"coll1":     "coll2",
+		"db1.":      "db2.",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{"db1": "db2"}, r.DBWildcard)
+	assert.Equal(t, map[string][]collref.Name{
+		"db1.coll1": {
+			collref.New("db2", "coll2"),
+		},
+		"default.coll1": {
+			collref.New("", "coll2"),
+		},
+	}, r.NameMapping)
+}
+
+func TestNewCollMapperFromPlan(t *testing.T) {
+	plan := &apiv1.RestorePlan{Mapping: []*apiv1.RestoreMapping{
+		{
+			Source: "db1",
+			Target: "db2",
+			Colls: []*apiv1.RestoreCollectionMapping{
+				{Source: "coll1", Target: "coll2"},
+				{Source: "coll2", Target: "coll3"},
+			},
+		},
+		{
+			Source: "db1",
+			Target: "db3",
+			Colls: []*apiv1.RestoreCollectionMapping{
+				{Source: "coll1", Target: "coll2"},
+				{Source: "coll2", Target: "coll3"},
+			},
+		},
+	}}
+
+	mapper, err := newCollMapperFromPlan(plan)
+	assert.NoError(t, err)
+	tMapper, ok := mapper.(*restore.TableMapper)
+	assert.True(t, ok)
+	assert.Equal(t, map[string][]collref.Name{
+		"db1.coll1": {
+			collref.New("db2", "coll2"),
+			collref.New("db3", "coll2"),
+		},
+		"db1.coll2": {
+			collref.New("db2", "coll3"),
+			collref.New("db3", "coll3"),
+		},
+	}, tMapper.NameMapping)
+}
+
+func TestNewCollMapper(t *testing.T) {
+	t.Run("FromPlan", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{RestorePlan: &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{
+				{
+					Source: "db1",
+					Target: "db2",
+					Colls: []*apiv1.RestoreCollectionMapping{
+						{Source: "coll1", Target: "coll2"},
+					},
+				},
+			},
+		}}
+		mapper, err := newCollMapper(request)
+		assert.NoError(t, err)
+		target := mapper.TargetNames(collref.New("db1", "coll1"))
+		assert.ElementsMatch(t, []collref.Name{collref.New("db2", "coll2")}, target)
+	})
+
+	t.Run("FromCollRename", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{CollectionRenames: map[string]string{
+			"db1.coll1": "db2.coll2",
+		}}
+		mapper, err := newCollMapper(request)
+		assert.NoError(t, err)
+		target := mapper.TargetNames(collref.New("db1", "coll1"))
+		assert.ElementsMatch(t, []collref.Name{collref.New("db2", "coll2")}, target)
+	})
+
+	t.Run("FromCollSuffix", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{CollectionSuffix: "_suffix"}
+		mapper, err := newCollMapper(request)
+		assert.NoError(t, err)
+		target := mapper.TargetNames(collref.New("db1", "coll1"))
+		assert.ElementsMatch(t, []collref.Name{collref.New("db1", "coll1_suffix")}, target)
+	})
+}
+
+func TestNewDBMapper(t *testing.T) {
+	t.Run("FromPlan", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{Mapping: []*apiv1.RestoreMapping{{
+			Source: "db1",
+			Target: "db2",
+		}, {
+			Source: "db1",
+			Target: "db3",
+		}}}
+
+		mapper, err := newDBMapper(plan)
+		assert.NoError(t, err)
+		assert.Equal(t, map[string][]restore.DBMapping{
+			"db1": {
+				{Target: "db2"},
+				{Target: "db3"},
+			},
+		}, mapper)
+	})
+
+	t.Run("Empty", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{}
+		mapper, err := newDBMapper(plan)
+		assert.NoError(t, err)
+		assert.Empty(t, mapper)
+	})
+}
+
+func TestNewFilterFromDBCollections(t *testing.T) {
+	f, err := newFilterFromDBCollections(`{"db1":[],"db2":["coll1","coll2"],"": ["coll3"]}`)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]filter.CollFilter{
+		"db1":     {AllowAll: true},
+		"db2":     {CollName: map[string]struct{}{"coll1": {}, "coll2": {}}},
+		"default": {CollName: map[string]struct{}{"coll3": {}}},
+	}, f.DBCollFilter)
+}
+
+func TestNewFilterFromCollectionNames(t *testing.T) {
+	f, err := newFilterFromCollectionNames([]string{"coll1", "db2.coll2"})
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]filter.CollFilter{
+		"default": {CollName: map[string]struct{}{"coll1": {}}},
+		"db2":     {CollName: map[string]struct{}{"coll2": {}}},
+	}, f.DBCollFilter)
+}
+
+func TestNewBackupFilter(t *testing.T) {
+	t.Run("FromDBCollections", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{
+			// CollectionNames will be ignored
+			CollectionNames: []string{"coll1", "db2.coll2"},
+			DbCollections:   apiv1.JSON(`{"db1":[],"db2":["coll1","coll2"], "": ["coll3"]}`),
+		}
+		f, err := newBackupFilter(request)
+		assert.NoError(t, err)
+		assert.Equal(t, map[string]filter.CollFilter{
+			"db1":     {AllowAll: true},
+			"db2":     {CollName: map[string]struct{}{"coll1": {}, "coll2": {}}},
+			"default": {CollName: map[string]struct{}{"coll3": {}}},
+		}, f.DBCollFilter)
+	})
+
+	t.Run("FromCollectionNames", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{CollectionNames: []string{"coll1", "db2.coll2"}}
+		f, err := newBackupFilter(request)
+		assert.NoError(t, err)
+		assert.Equal(t, map[string]filter.CollFilter{
+			"default": {CollName: map[string]struct{}{"coll1": {}}},
+			"db2":     {CollName: map[string]struct{}{"coll2": {}}},
+		}, f.DBCollFilter)
+	})
+
+	t.Run("Empty", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{}
+		f, err := newBackupFilter(request)
+		assert.NoError(t, err)
+		assert.Empty(t, f.DBCollFilter)
+	})
+}
+
+func TestNewFilterFromPlan(t *testing.T) {
+	plan := &apiv1.RestorePlan{Filter: map[string]apiv1.CollFilter{
+		"db1": {Colls: []string{"coll1", "coll2"}},
+		"db2": {Colls: []string{"coll3", "coll4"}},
+	}}
+	f, err := newFilterFromPlan(plan)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]filter.CollFilter{
+		"db1": {CollName: map[string]struct{}{"coll1": {}, "coll2": {}}},
+		"db2": {CollName: map[string]struct{}{"coll3": {}, "coll4": {}}},
+	}, f.DBCollFilter)
+}
+
+func TestNewTaskFilter(t *testing.T) {
+	t.Run("FromPlan", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{
+			// dbCollectionsAfterRename will be ignored
+			DbCollectionsAfterRename: apiv1.JSON(`{"db1":[],"db2":["coll1","coll2"], "": ["coll3"]}`),
+			RestorePlan: &apiv1.RestorePlan{
+				Filter: map[string]apiv1.CollFilter{
+					"db1": {Colls: []string{"coll1", "coll2"}},
+					"db2": {Colls: []string{"coll3", "coll4"}},
+				},
+			}}
+		f, err := newTaskFilter(request)
+		assert.NoError(t, err)
+		assert.Equal(t, map[string]filter.CollFilter{
+			"db1": {CollName: map[string]struct{}{"coll1": {}, "coll2": {}}},
+			"db2": {CollName: map[string]struct{}{"coll3": {}, "coll4": {}}},
+		}, f.DBCollFilter)
+	})
+
+	t.Run("FromDBCollections", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{DbCollectionsAfterRename: apiv1.JSON(
+			`{"db1":[],"db2":["coll1","coll2"], "": ["coll3"]}`)}
+		f, err := newTaskFilter(request)
+		assert.NoError(t, err)
+		assert.Equal(t, map[string]filter.CollFilter{
+			"db1":     {AllowAll: true},
+			"db2":     {CollName: map[string]struct{}{"coll1": {}, "coll2": {}}},
+			"default": {CollName: map[string]struct{}{"coll3": {}}},
+		}, f.DBCollFilter)
+	})
+
+	t.Run("Empty", func(t *testing.T) {
+		request := &apiv1.RestoreBackupRequest{}
+		f, err := newTaskFilter(request)
+		assert.NoError(t, err)
+		assert.Empty(t, f.DBCollFilter)
+	})
+}
+
+func TestNewCollOverridesFromPlan(t *testing.T) {
+	t.Run("NilPlan", func(t *testing.T) {
+		result := newCollOverridesFromPlan(nil)
+		assert.Nil(t, result)
+	})
+
+	t.Run("NoOverrides", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{{
+				Source: "db1",
+				Target: "db2",
+				Colls: []*apiv1.RestoreCollectionMapping{
+					{Source: "coll1", Target: "coll2"},
+				},
+			}},
+		}
+		result := newCollOverridesFromPlan(plan)
+		assert.Nil(t, result)
+	})
+
+	t.Run("WithShardNumOverride", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{{
+				Source: "db1",
+				Target: "db2",
+				Colls: []*apiv1.RestoreCollectionMapping{
+					{
+						Source:   "coll1",
+						Target:   "coll2",
+						Override: &apiv1.RestoreCollectionOverride{ShardNum: 4},
+					},
+				},
+			}},
+		}
+		result := newCollOverridesFromPlan(plan)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(4), result["db2.coll2"].ShardNum)
+		assert.Equal(t, "", result["db2.coll2"].Description)
+	})
+
+	t.Run("WithDescriptionOverride", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{{
+				Source: "db1",
+				Target: "db2",
+				Colls: []*apiv1.RestoreCollectionMapping{
+					{
+						Source:   "coll1",
+						Target:   "coll2",
+						Override: &apiv1.RestoreCollectionOverride{Description: "new desc"},
+					},
+				},
+			}},
+		}
+		result := newCollOverridesFromPlan(plan)
+		assert.Len(t, result, 1)
+		assert.Equal(t, "new desc", result["db2.coll2"].Description)
+	})
+
+	t.Run("WithBothOverrides", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{{
+				Source: "db1",
+				Target: "db2",
+				Colls: []*apiv1.RestoreCollectionMapping{
+					{
+						Source:   "coll1",
+						Target:   "coll2",
+						Override: &apiv1.RestoreCollectionOverride{ShardNum: 2, Description: "desc"},
+					},
+					{
+						Source: "coll3",
+						Target: "coll4",
+					},
+				},
+			}},
+		}
+		result := newCollOverridesFromPlan(plan)
+		assert.Len(t, result, 1)
+		assert.Equal(t, int32(2), result["db2.coll2"].ShardNum)
+		assert.Equal(t, "desc", result["db2.coll2"].Description)
+		_, exists := result["db2.coll4"]
+		assert.False(t, exists)
+	})
+
+	t.Run("EmptyOverrideSkipped", func(t *testing.T) {
+		plan := &apiv1.RestorePlan{
+			Mapping: []*apiv1.RestoreMapping{{
+				Source: "db1",
+				Target: "db2",
+				Colls: []*apiv1.RestoreCollectionMapping{
+					{
+						Source:   "coll1",
+						Target:   "coll2",
+						Override: &apiv1.RestoreCollectionOverride{},
+					},
+				},
+			}},
+		}
+		result := newCollOverridesFromPlan(plan)
+		assert.Nil(t, result)
+	})
+}
+
+// stubRestoreJob stands in for *app.RestoreJob: a canned settlement and a
+// call count, so tests can assert whether the handler ran the job at all. The
+// count is atomic because async tests poll it from the test goroutine while
+// the job goroutine increments it.
+type stubRestoreJob struct {
+	status  jobstate.RestoreStatus
+	waitErr error
+	calls   atomic.Int32
+}
+
+func (j *stubRestoreJob) Run(context.Context) { j.calls.Add(1) }
+
+func (j *stubRestoreJob) Wait(context.Context) (jobstate.RestoreStatus, error) {
+	return j.status, j.waitErr
+}
+
+// stubRestoreFactory stands in for the job factory: the params and request it
+// was called with, a canned construction error, and a call count so tests can
+// assert whether the handler reached the action at all.
+type stubRestoreFactory struct {
+	params *cfg.Config
+	req    app.RestoreRequest
+	newErr error
+	job    *stubRestoreJob
+	calls  int
+}
+
+// withRestoreBackup wires the stub as the job factory. newErr simulates a
+// construction failure — client build, meta read or registration — which
+// happens before any job runs.
+func withRestoreBackup(stub *stubRestoreFactory) Option {
+	return func(c *config) {
+		c.newRestoreJob = func(_ context.Context, params *cfg.Config, req app.RestoreRequest) (restoreJob, error) {
+			stub.params = params
+			stub.req = req
+			stub.calls++
+			if stub.newErr != nil {
+				return nil, stub.newErr
+			}
+			return stub.job, nil
+		}
+	}
+}
+
+// newStubRestoreStatus returns a job snapshot the rendering can run over.
+func newStubRestoreStatus() jobstate.RestoreStatus {
+	return jobstate.RestoreStatus{
+		ID:        "task-1",
+		State:     jobstate.RestoreStateSuccess,
+		StartTime: time.Unix(1, 0),
+		EndTime:   time.Unix(2, 0),
+	}
+}
+
+func restoreBackup(t *testing.T, s *Server, body string, requestID string) apiv1.RestoreBackupResponse {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/restore", strings.NewReader(body))
+	if requestID != "" {
+		req.Header.Set("request_id", requestID)
+	}
+	s.engine.ServeHTTP(w, req)
+
+	var resp apiv1.RestoreBackupResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	return resp
+}
+
+func TestHandleRestoreBackup(t *testing.T) {
+	t.Run("SyncRunsTheJob", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		gr := &stubGetRestore{status: newStubRestoreStatus()}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(gr, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, "success", resp.GetMsg())
+		assert.Equal(t, "task-1", resp.Data.Id)
+		assert.Equal(t, 1, stub.calls)
+		assert.Equal(t, int32(1), job.calls.Load())
+		// The view is read through the get-restore usecase, for the same
+		// task id that went to the job factory.
+		assert.Equal(t, stub.req.TaskID, gr.id)
+	})
+
+	t.Run("RejectsInvalidBody", func(t *testing.T) {
+		stub := &stubRestoreFactory{}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/restore", strings.NewReader("{invalid"))
+		s.engine.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("RejectsMissingNameWithoutBuildingAJob", func(t *testing.T) {
+		stub := &stubRestoreFactory{}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{}`, "")
+
+		assert.Equal(t, backuppb.ResponseCode_Parameter_Error, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "backup name is required")
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("DefaultsRequestIdAndTaskId", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "")
+
+		// The response echoes a generated request id; the factory got a
+		// generated task id of the endpoint's own "restore_" shape.
+		assert.NotEmpty(t, resp.GetRequestId())
+		assert.True(t, strings.HasPrefix(stub.req.TaskID, "restore_"))
+		assert.Equal(t, "backup1", stub.req.BackupName)
+	})
+
+	t.Run("ForwardsRequestId", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		// This endpoint takes the request id from the body field, unlike the
+		// list and delete handlers, which read the header.
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","requestId":"rid-1"}`, "")
+
+		assert.Equal(t, "rid-1", resp.GetRequestId())
+	})
+
+	t.Run("SecondariesReachTheOption", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","secondaries":[{"address":"http://10.0.0.2:19530","token":"user:password"},{"address":"http://10.0.0.3:19530","token":"raw-api-token"}]}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, []restore.Secondary{
+			{Address: "http://10.0.0.2:19530", Token: "user:password"},
+			{Address: "http://10.0.0.3:19530", Token: "raw-api-token"},
+		}, stub.req.Option.Secondaries)
+	})
+
+	t.Run("RejectsInvalidSecondaryWithoutBuildingAJob", func(t *testing.T) {
+		stub := &stubRestoreFactory{}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","secondaries":[{"address":"10.0.0.2:19530"}]}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Parameter_Error, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "invalid secondary")
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("RejectsLegacyStringSecondaries", func(t *testing.T) {
+		stub := &stubRestoreFactory{}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/restore", strings.NewReader(
+			`{"backup_name":"backup1","secondaries":["http://10.0.0.2:19530"]}`))
+		s.engine.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("BucketNameForksConfig", func(t *testing.T) {
+		// The v1 bucket_name field is applied as a config override, not sent
+		// through the request.
+		stub := &stubRestoreFactory{job: &stubRestoreJob{}}
+		s := newLoadedTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","bucket_name":"other-bucket"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		require.NotNil(t, stub.params)
+		assert.Equal(t, "other-bucket", stub.params.Backup.Storage.BucketName.Val)
+		// The fork, not the server's own config, reaches the job.
+		assert.NotSame(t, s.params, stub.params)
+		// The server's own config stays on its own bucket.
+		assert.NotEqual(t, "other-bucket", s.params.Backup.Storage.BucketName.Val)
+	})
+
+	t.Run("PathForksConfig", func(t *testing.T) {
+		// The v1 path field is applied as a config override, not sent
+		// through the request.
+		stub := &stubRestoreFactory{job: &stubRestoreJob{}}
+		s := newLoadedTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","path":"other"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		require.NotNil(t, stub.params)
+		assert.Equal(t, "other", stub.params.Backup.Storage.RootPath.Val)
+		// The fork, not the server's own config, reaches the job.
+		assert.NotSame(t, s.params, stub.params)
+		// The server's own config stays on the default root path.
+		assert.Equal(t, "backup", s.params.Backup.Storage.RootPath.Val)
+	})
+
+	t.Run("NoOverridesKeepServerConfig", func(t *testing.T) {
+		stub := &stubRestoreFactory{job: &stubRestoreJob{}}
+		s := newLoadedTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		// No override fields: the config travels to the job untouched.
+		assert.Same(t, s.params, stub.params)
+	})
+
+	t.Run("MapsUnknownBackupToParameterError", func(t *testing.T) {
+		stub := &stubRestoreFactory{newErr: fmt.Errorf("app: backup backup1: %w", app.ErrBackupNotFound)}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Parameter_Error, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "backup backup1: backup not found")
+		assert.Equal(t, 1, stub.calls)
+	})
+
+	t.Run("MapsJobBuildErrorToFail", func(t *testing.T) {
+		stub := &stubRestoreFactory{newErr: errors.New("dial timeout")}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "dial timeout")
+		assert.Equal(t, 1, stub.calls)
+	})
+
+	t.Run("MapsFailedStatusToFail", func(t *testing.T) {
+		job := &stubRestoreJob{status: jobstate.RestoreStatus{
+			State:        jobstate.RestoreStateFail,
+			ErrorMessage: "bulk insert failed",
+		}}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "bulk insert failed")
+		assert.Equal(t, int32(1), job.calls.Load())
+	})
+
+	t.Run("MapsWaitErrorToFail", func(t *testing.T) {
+		job := &stubRestoreJob{waitErr: errors.New("context deadline exceeded")}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "context deadline exceeded")
+	})
+
+	t.Run("MapsGetRestoreErrorToFail", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{executeErr: errors.New("task mgr closed")}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "task mgr closed")
+	})
+
+	t.Run("AsyncRunsTheJobAndReportsIt", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreFactory{job: job}
+		s := newListTestServer(t, withRestoreBackup(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreBackup(t, s, `{"backup_name":"backup1","async":true}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, "restore backup is executing asynchronously", resp.GetMsg())
+		assert.Equal(t, "task-1", resp.Data.Id)
+		assert.Eventually(t, func() bool { return job.calls.Load() == 1 }, time.Second, 10*time.Millisecond)
+	})
+}
+
+// stubRestoreSecondaryFactory stands in for the secondary job factory: the
+// params and request it was called with, a canned construction error, and a
+// call count.
+type stubRestoreSecondaryFactory struct {
+	params *cfg.Config
+	req    app.RestoreSecondaryRequest
+	newErr error
+	job    *stubRestoreJob
+	calls  int
+}
+
+// withRestoreSecondary wires the stub as the secondary job factory. newErr
+// simulates a construction failure, which happens before any job runs.
+func withRestoreSecondary(stub *stubRestoreSecondaryFactory) Option {
+	return func(c *config) {
+		c.newRestoreSecondaryJob = func(_ context.Context, params *cfg.Config, req app.RestoreSecondaryRequest) (restoreJob, error) {
+			stub.params = params
+			stub.req = req
+			stub.calls++
+			if stub.newErr != nil {
+				return nil, stub.newErr
+			}
+			return stub.job, nil
+		}
+	}
+}
+
+func restoreSecondary(t *testing.T, s *Server, body string, requestID string) apiv1.RestoreBackupResponse {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/restore_secondary", strings.NewReader(body))
+	if requestID != "" {
+		req.Header.Set("request_id", requestID)
+	}
+	s.engine.ServeHTTP(w, req)
+
+	var resp apiv1.RestoreBackupResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	return resp
+}
+
+func TestHandleRestoreSecondary(t *testing.T) {
+	t.Run("SyncRunsTheJob", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreSecondaryFactory{job: job}
+		gr := &stubGetRestore{status: newStubRestoreStatus()}
+		s := newListTestServer(t, withRestoreSecondary(stub), withGetRestore(gr, nil))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst"}`, "")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, "success", resp.GetMsg())
+		assert.Equal(t, "task-1", resp.Data.Id)
+		assert.Equal(t, 1, stub.calls)
+		assert.Equal(t, int32(1), job.calls.Load())
+		// The request id doubles as the restore task id.
+		assert.NotEmpty(t, resp.GetRequestId())
+		assert.Equal(t, resp.GetRequestId(), stub.req.TaskID)
+		// The view is read through the get-restore usecase, for the task id
+		// the request id doubles as.
+		assert.Equal(t, stub.req.TaskID, gr.id)
+	})
+
+	t.Run("RejectsMissingClusterIDsWithoutBuildingAJob", func(t *testing.T) {
+		stub := &stubRestoreSecondaryFactory{}
+		s := newListTestServer(t, withRestoreSecondary(stub))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1"}`, "")
+
+		assert.Equal(t, backuppb.ResponseCode_Parameter_Error, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "source cluster id is required")
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("PathForksConfig", func(t *testing.T) {
+		// The v1 path field is applied as a config override, not sent
+		// through the request.
+		stub := &stubRestoreSecondaryFactory{job: &stubRestoreJob{}}
+		s := newLoadedTestServer(t, withRestoreSecondary(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst","path":"other"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		require.NotNil(t, stub.params)
+		assert.Equal(t, "other", stub.params.Backup.Storage.RootPath.Val)
+		// The fork, not the server's own config, reaches the job.
+		assert.NotSame(t, s.params, stub.params)
+		// The server's own config stays on the default root path.
+		assert.Equal(t, "backup", s.params.Backup.Storage.RootPath.Val)
+	})
+
+	t.Run("MapsUnknownBackupToParameterError", func(t *testing.T) {
+		stub := &stubRestoreSecondaryFactory{newErr: fmt.Errorf("app: backup backup1: %w", app.ErrBackupNotFound)}
+		s := newListTestServer(t, withRestoreSecondary(stub))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Parameter_Error, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "backup backup1: backup not found")
+	})
+
+	t.Run("MapsJobBuildErrorToFail", func(t *testing.T) {
+		stub := &stubRestoreSecondaryFactory{newErr: errors.New("dial timeout")}
+		s := newListTestServer(t, withRestoreSecondary(stub))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "dial timeout")
+		assert.Equal(t, 1, stub.calls)
+	})
+
+	t.Run("MapsFailedStatusToFail", func(t *testing.T) {
+		job := &stubRestoreJob{status: jobstate.RestoreStatus{
+			State:        jobstate.RestoreStateFail,
+			ErrorMessage: "ddl replay failed",
+		}}
+		stub := &stubRestoreSecondaryFactory{job: job}
+		s := newListTestServer(t, withRestoreSecondary(stub))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst"}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "ddl replay failed")
+	})
+
+	t.Run("AsyncRunsTheJobAndReportsIt", func(t *testing.T) {
+		job := &stubRestoreJob{}
+		stub := &stubRestoreSecondaryFactory{job: job}
+		s := newListTestServer(t, withRestoreSecondary(stub), withGetRestore(&stubGetRestore{status: newStubRestoreStatus()}, nil))
+
+		resp := restoreSecondary(t, s, `{"backup_name":"backup1","sourceClusterID":"src","targetClusterID":"dst","async":true}`, "rid-1")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, "restore backup is executing asynchronously", resp.GetMsg())
+		assert.Eventually(t, func() bool { return job.calls.Load() == 1 }, time.Second, 10*time.Millisecond)
+	})
+}

@@ -1,0 +1,153 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zilliztech/milvus-backup/core/apiv1"
+	"github.com/zilliztech/milvus-backup/core/proto/backuppb"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+)
+
+// stubGetRestore stands in for app.GetRestore: a canned snapshot, the id it
+// was called with, and a call count so tests can assert whether the handler
+// reached the action at all.
+type stubGetRestore struct {
+	id         string
+	status     jobstate.RestoreStatus
+	executeErr error
+	calls      int
+}
+
+func (s *stubGetRestore) Execute(_ context.Context, id string) (jobstate.RestoreStatus, error) {
+	s.id = id
+	s.calls++
+	return s.status, s.executeErr
+}
+
+// withGetRestore wires the stub as the get-restore usecase. newErr simulates
+// the construction failure, which happens before any Execute call.
+func withGetRestore(stub *stubGetRestore, newErr error) Option {
+	return func(c *config) {
+		c.newGetRestore = func() (getRestoreUC, error) {
+			return stub, newErr
+		}
+	}
+}
+
+func getRestore(t *testing.T, s *Server, query, requestID string) apiv1.RestoreBackupResponse {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/get_restore"+query, nil)
+	if requestID != "" {
+		req.Header.Set("request_id", requestID)
+	}
+	s.engine.ServeHTTP(w, req)
+
+	var resp apiv1.RestoreBackupResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	return resp
+}
+
+// newRestoreStatus returns the snapshot the v1 rendering reads.
+func newRestoreStatus() jobstate.RestoreStatus {
+	return jobstate.RestoreStatus{
+		ID:           "task-1",
+		State:        jobstate.RestoreStateExecuting,
+		ErrorMessage: "coll1 fail",
+		StartTime:    time.Now(),
+		EndTime:      time.Now(),
+		Colls: map[collref.Name]jobstate.RestoreCollStatus{
+			collref.New("db1", "coll1"): {
+				TotalSize: 100,
+				Jobs: []jobstate.RestoreJobStatus{
+					{State: jobstate.RestoreJobRunning, Size: 100, Progress: 42},
+				},
+			},
+		},
+	}
+}
+
+func TestHandleGetRestore(t *testing.T) {
+	t.Run("RendersTheTaskView", func(t *testing.T) {
+		stub := &stubGetRestore{status: newRestoreStatus()}
+		s := newListTestServer(t, withGetRestore(stub, nil))
+
+		resp := getRestore(t, s, "?id=task-1", "")
+
+		assert.Equal(t, backuppb.ResponseCode_Success, resp.GetCode())
+		assert.Equal(t, "success", resp.GetMsg())
+		data := resp.Data
+		require.NotNil(t, data)
+		assert.Equal(t, "task-1", data.Id)
+		assert.Equal(t, backuppb.RestoreTaskStateCode_EXECUTING, data.StateCode)
+		assert.Equal(t, "coll1 fail", data.ErrorMessage)
+		assert.Equal(t, int32(42), data.Progress)
+		assert.Equal(t, 1, stub.calls)
+		assert.Equal(t, "task-1", stub.id)
+	})
+
+	t.Run("RejectsEmptyIDWithoutCallingUsecase", func(t *testing.T) {
+		stub := &stubGetRestore{}
+		s := newListTestServer(t, withGetRestore(stub, nil))
+
+		resp := getRestore(t, s, "", "")
+
+		// The historical contract answers Fail here, not Parameter_Error.
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Equal(t, "empty restore id", resp.GetMsg())
+		assert.Zero(t, stub.calls)
+	})
+
+	t.Run("GeneratesRequestIdWhenMissing", func(t *testing.T) {
+		stub := &stubGetRestore{status: newRestoreStatus()}
+		s := newListTestServer(t, withGetRestore(stub, nil))
+
+		resp := getRestore(t, s, "?id=task-1", "")
+
+		assert.NotEmpty(t, resp.GetRequestId())
+	})
+
+	t.Run("ForwardsRequestId", func(t *testing.T) {
+		stub := &stubGetRestore{status: newRestoreStatus()}
+		s := newListTestServer(t, withGetRestore(stub, nil))
+
+		resp := getRestore(t, s, "?id=task-1", "rid-1")
+
+		assert.Equal(t, "rid-1", resp.GetRequestId())
+	})
+
+	t.Run("MapsConstructorErrorToFail", func(t *testing.T) {
+		s := newListTestServer(t, withGetRestore(&stubGetRestore{}, errors.New("dial timeout")))
+
+		resp := getRestore(t, s, "?id=task-1", "")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "dial timeout")
+	})
+
+	t.Run("MapsExecuteErrorToFail", func(t *testing.T) {
+		stub := &stubGetRestore{
+			executeErr: fmt.Errorf("app: get restore task task-1: %w", jobstate.ErrTaskNotFound),
+		}
+		s := newListTestServer(t, withGetRestore(stub, nil))
+
+		resp := getRestore(t, s, "?id=task-1", "")
+
+		assert.Equal(t, backuppb.ResponseCode_Fail, resp.GetCode())
+		assert.Contains(t, resp.GetMsg(), "task not found")
+		assert.Equal(t, 1, stub.calls)
+	})
+}

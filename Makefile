@@ -1,0 +1,58 @@
+# Variables
+BINARY_NAME=milvus-backup
+PKG := github.com/zilliztech/milvus-backup
+BUILD_VERSION=$(if $(VERSION),$(VERSION),$(shell git describe --tags --always))
+BUILD_COMMIT=$(if $(COMMIT),$(COMMIT),$(shell git rev-parse --short HEAD))
+DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+LDFLAGS += -X "$(PKG)/version.Version=$(BUILD_VERSION)"
+LDFLAGS += -X "$(PKG)/version.Commit=$(BUILD_COMMIT)"
+LDFLAGS += -X "$(PKG)/version.Date=$(DATE)"
+
+# Default target
+all: gen build
+
+test:
+	@echo "Running unit tests..."
+	@go test --race --cover ./...
+
+# Build the binary
+build:
+	@echo "Building Backup binary..."
+	@echo "Version: $(BUILD_VERSION)"
+	@echo "Commit: $(BUILD_COMMIT)"
+	@echo "Date: $(DATE)"
+	@GO111MODULE=on CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o $(BINARY_NAME)
+	@echo "Building Backup binary done"
+
+# Load every sample config with the built binary. The samples are what people
+# copy, so a broken one is otherwise only found by the person copying it.
+check-configs: build
+	@echo "Loading sample configs..."
+	@for f in configs/*.yaml; do \
+		./$(BINARY_NAME) config show --config $$f > /dev/null \
+			|| { echo "FAILED to load $$f"; exit 1; }; \
+	done
+	@echo "Sample configs loaded"
+
+gen:
+	./scripts/gen_swag.sh
+	./scripts/gen_proto.sh
+	go generate ./...
+
+gen-mock:
+	@echo "Generating mock files..."
+	@mockery
+	@echo "Generating mock files done"
+
+fmt:
+	@echo Formatting code...
+	@find . -name '*.go' -type f ! -exec grep -q "DO NOT EDIT" {} \; -print0 | xargs -0 goimports -w --local $(PKG)
+	@echo Format code done
+
+lint:
+	@echo Running linters...
+	@golangci-lint run ./...
+	@echo Lint passed
+
+.PHONY: all build check-configs gen lint

@@ -1,0 +1,829 @@
+package secondary
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"math/rand/v2"
+	"path"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/zilliztech/milvus-backup/core/restore/conv"
+
+	"github.com/zilliztech/milvus-backup/core/proto/backuppb"
+	"github.com/zilliztech/milvus-backup/core/tasklet"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/client/milvus"
+	"github.com/zilliztech/milvus-backup/internal/collref"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+	"github.com/zilliztech/milvus-backup/internal/log"
+	"github.com/zilliztech/milvus-backup/internal/meta"
+	"github.com/zilliztech/milvus-backup/internal/snapshotbundle"
+	"github.com/zilliztech/milvus-backup/internal/snapshotsource"
+	"github.com/zilliztech/milvus-backup/internal/storage"
+)
+
+type TaskArgs struct {
+	TaskID string
+
+	SourceClusterID string
+	TargetClusterID string
+
+	Backup *backuppb.BackupInfo
+
+	Params *cfg.Config
+
+	BackupDir     string
+	BackupStorage storage.Client
+
+	// MilvusStorage is the target cluster's own object storage. When it is not
+	// the same bucket/backend as BackupStorage, binlogs are staged into it
+	// before the import message is broadcast, because DataCoord lists import
+	// paths only from its own storage. A snapshot backup stages nothing — the
+	// target reads the bundle itself — but resolves where it reads it from
+	// against this storage's config.
+	MilvusStorage storage.Client
+
+	Store *jobstate.Store
+}
+
+type Task struct {
+	args TaskArgs
+
+	// snapSource is where the target reads a snapshot backup's bundles from,
+	// and snapLayouts is what the preflight read of every bundle learned, keyed
+	// by collection id: the layout its import message has to name. Both are
+	// only set for the snapshot format.
+	snapSource  snapshotsource.Source
+	snapLayouts map[int64]datapb.SnapshotLayout
+
+	grpc    milvus.Grpc
+	restful milvus.Restful
+
+	streamCli milvus.Stream
+
+	tracker *jobstate.RestoreTracker
+
+	logger *zap.Logger
+}
+
+func NewTask(args TaskArgs) (*Task, error) {
+	return &Task{
+		args: args,
+
+		tracker: args.Store.AddRestoreTask(args.TaskID),
+
+		logger: log.With(zap.String("task_id", args.TaskID)),
+	}, nil
+}
+
+func (t *Task) initClients() error {
+	grpcCli, err := milvus.NewGrpc(&t.args.Params.Milvus)
+	if err != nil {
+		return fmt.Errorf("secondary: create grpc client: %w", err)
+	}
+	t.grpc = grpcCli
+
+	restfulCli, err := milvus.NewRestful(&t.args.Params.Milvus)
+	if err != nil {
+		return fmt.Errorf("secondary: create restful client: %w", err)
+	}
+	t.restful = restfulCli
+
+	return nil
+}
+
+func (t *Task) closeClients() {
+	if t.streamCli != nil {
+		t.streamCli.Close()
+	}
+	if t.grpc != nil {
+		if err := t.grpc.Close(); err != nil {
+			t.logger.Warn("close grpc client", zap.Error(err))
+		}
+	}
+}
+
+var _ tasklet.Tasklet = (*Task)(nil)
+
+// Tracker hands the job the write handle the task registered at construction.
+// The task settles it before Execute returns; the job that owns the run reads
+// its terminal state through it.
+func (t *Task) Tracker() *jobstate.RestoreTracker { return t.tracker }
+
+func (t *Task) Execute(ctx context.Context) error {
+	// Check before any client is created or any DDL is broadcast, so a backup
+	// that cannot produce a matching secondary is rejected before it leaves a
+	// half-created collection behind.
+	if err := checkIndexExtra(t.args.Backup); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	defer t.closeClients()
+	if err := t.initClients(); err != nil {
+		// Client construction fails before the job has a state to run in, but
+		// the job still has to settle: a caller waiting on the store must not
+		// be left watching a task that is never going to move again.
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	t.tracker.SetExecuting()
+
+	if err := t.checkFormatSupport(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	if err := t.checkBackupHasFullMeta(); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	if err := t.checkTargetReady(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	if err := t.checkTargetIsUnused(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	if err := t.checkSnapshotBundles(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	pchs := t.args.Backup.GetPhysicalChannelNames()
+	walName, err := sourceWALName(t.args.Backup)
+	if err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+	t.streamCli = milvus.NewStreamClient(t.args.SourceClusterID, t.args.TaskID, pchs, walName, t.grpc)
+
+	if err := t.runDBTasks(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return fmt.Errorf("secondary: run database tasks: %w", err)
+	}
+
+	if err := t.runCollTasks(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return fmt.Errorf("secondary: run collection tasks: %w", err)
+	}
+
+	if err := t.sendRBACMsg(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return fmt.Errorf("secondary: send rbac msg: %w", err)
+	}
+
+	if err := t.sendFlushAll(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return fmt.Errorf("secondary: send flush all: %w", err)
+	}
+
+	t.logger.Info("wait confirm")
+	t.streamCli.WaitConfirm()
+
+	if err := t.verifyRestored(ctx); err != nil {
+		t.tracker.SetFail(err)
+		return err
+	}
+
+	t.tracker.SetSuccess()
+	t.logger.Info("restore done")
+	return nil
+}
+
+// checkFormatSupport refuses a backup whose data this restore cannot replay,
+// before any DDL is broadcast. A binlog backup replays as import messages
+// pointing at its binlogs. A snapshot backup replays as a snapshot-sourced
+// import message, which the target turns into the import job the import api
+// would have created: that import exists only on a new enough secondary, and
+// where the target reads the bundle from is resolved here, against the
+// target's own storage, the way a plain import_snap restore resolves it.
+func (t *Task) checkFormatSupport(ctx context.Context) error {
+	switch format := t.args.Backup.GetFormat(); format {
+	case meta.FormatBinlog:
+		return nil
+	case meta.FormatSnapshot:
+		if !t.grpc.HasFeature(milvus.ImportSnapshot) {
+			return fmt.Errorf("secondary: a snapshot format backup replays its data through the target's " +
+				"snapshot import, which needs a Milvus 3.0.4 or newer secondary; this server is older. " +
+				"Take the backup in the binlog format (create --for secondary) to restore it here")
+		}
+		if t.args.MilvusStorage == nil {
+			return fmt.Errorf("secondary: a snapshot format backup needs the target's storage config to " +
+				"resolve where the target reads the bundles from")
+		}
+		source, err := snapshotsource.New(ctx, t.args.MilvusStorage.Config(), t.args.BackupStorage.Config(), t.args.BackupDir, true)
+		if err != nil {
+			return fmt.Errorf("secondary: resolve the snapshot source: %w", err)
+		}
+		t.snapSource = source
+		t.logger.Info("restore secondary from snapshot bundles",
+			zap.String("source_uri", source.DirURI),
+			zap.Bool("external_spec_set", source.ExternalSpec != ""),
+			zap.Bool("source_sas_set", source.SourceSASSet))
+		return nil
+	default:
+		// Without this an unknown format would go down the binlog path, find no
+		// segments, and replay an empty collection.
+		return fmt.Errorf("secondary: backup %s was taken in the %q format, which this version of milvus-backup cannot restore",
+			t.args.Backup.GetName(), format)
+	}
+}
+
+// checkBackupHasFullMeta refuses to run against a backup whose cluster-level
+// fields are missing.
+//
+// A secondary restore broadcasts DDL on the source's control channel and
+// replays the source's flush-all messages per pchannel. Those fields are
+// written only to meta/full_meta.json; the per-level meta files do not carry
+// them, and meta.Read silently falls back to the per-level files when
+// full_meta.json is absent. Without this check the restore reads the
+// collection list fine and then fails at its first broadcast with
+// "no pch in message", which points nowhere near the cause.
+func (t *Task) checkBackupHasFullMeta() error {
+	b := t.args.Backup
+	var missing []string
+	if b.GetControlChannelName() == "" {
+		missing = append(missing, "control channel")
+	}
+	if len(b.GetPhysicalChannelNames()) == 0 {
+		missing = append(missing, "pchannel list")
+	}
+	if len(b.GetFlushAllMsgsBase64()) == 0 {
+		missing = append(missing, "flush-all messages")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("secondary: backup %q carries no %s. These are recorded only by a "+
+		"backup that flushed the source, and only in <backup_dir>/meta/full_meta.json. "+
+		"Either the backup was taken with --strategy=skip_flush or meta_only (the deprecated "+
+		"--force/-f flag means skip_flush), which by design records no flush point, or "+
+		"full_meta.json is missing where this restore reads the backup (check the copy if "+
+		"the backup was moved between buckets). A plain restore accepts such a backup; a "+
+		"secondary restore cannot, because it has no point in the source's stream to start "+
+		"replication from. Take the backup again with the default strategy",
+		b.GetName(), strings.Join(missing, ", "))
+}
+
+// sourceWALName learns the source cluster's WAL kind from the flush-all
+// messages the backup captured: every captured message is a real source WAL
+// message, so its id names the source's WAL. The replay stream fabricates
+// message ids of that kind; ids of any other kind would poison the
+// per-source replicate checkpoint milvus persists from the header, and a
+// later real CDC resuming the source's WAL from such a checkpoint fails
+// permanently with STREAMING_CODE_WALNAME_MISMATCH.
+func sourceWALName(b *backuppb.BackupInfo) (message.WALName, error) {
+	for _, msgB64 := range b.GetFlushAllMsgsBase64() {
+		raw, err := base64.StdEncoding.DecodeString(msgB64)
+		if err != nil {
+			continue
+		}
+		var msg commonpb.ImmutableMessage
+		if err := proto.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+		name := message.WALName(msg.GetId().GetWALName())
+		if milvus.SupportedFakeWALName(name) {
+			return name, nil
+		}
+	}
+	return message.WALNameUnknown, fmt.Errorf("secondary: backup %q carries no flush-all "+
+		"message id naming a supported source WAL (kafka, pulsar, rocksmq or woodpecker). "+
+		"The replay stream cannot fabricate message ids that a later CDC could resume "+
+		"the source's WAL from; take the backup again against a healthy source cluster",
+		b.GetName())
+}
+
+// checkTargetReady requires a zero checkpoint from the expected source on every
+// target channel. CDC and previous restores both advance these checkpoints.
+// This is a preflight check; CDC must remain stopped until the restore finishes.
+func (t *Task) checkTargetReady(ctx context.Context) error {
+	config, err := t.grpc.GetReplicateConfiguration(ctx)
+	if err != nil {
+		return fmt.Errorf("secondary: read target replicate configuration: %w", err)
+	}
+
+	var pchannels []string
+	for _, cluster := range config.GetClusters() {
+		if cluster.GetClusterId() == t.args.TargetClusterID {
+			pchannels = cluster.GetPchannels()
+			break
+		}
+	}
+	if len(pchannels) == 0 {
+		return fmt.Errorf("secondary: target %q has no pchannels in its replicate configuration; configure the target as a secondary before restoring", t.args.TargetClusterID)
+	}
+
+	for _, pchannel := range pchannels {
+		resp, err := t.grpc.GetReplicateInfo(ctx, t.args.SourceClusterID, pchannel)
+		if err != nil {
+			return fmt.Errorf("secondary: read the replicate checkpoint of %s: %w", pchannel, err)
+		}
+		checkpoint := resp.GetCheckpoint()
+		if checkpoint == nil {
+			return fmt.Errorf("secondary: target channel %s has no replicate checkpoint; verify that the target is configured as a secondary", pchannel)
+		}
+		if checkpoint.GetClusterId() != t.args.SourceClusterID {
+			return fmt.Errorf("secondary: target channel %s has source cluster %q, expected %q", pchannel, checkpoint.GetClusterId(), t.args.SourceClusterID)
+		}
+		if tick := checkpoint.GetTimeTick(); tick != 0 {
+			return fmt.Errorf("secondary: target %q already has a replicate checkpoint (%s is at time tick %d); "+
+				"CDC or an earlier restore has advanced it. Restore messages start at time tick 1 and may be discarded. "+
+				"Deploy a new secondary and keep CDC stopped until restore completes", t.args.TargetClusterID, pchannel, tick)
+		}
+	}
+
+	t.logger.Info("all target replicate checkpoints are at zero", zap.Int("pchannels", len(pchannels)))
+	return nil
+}
+
+// checkTargetIsUnused refuses to restore into a target that already holds one
+// of the collections in the backup.
+//
+// A secondary restore replays the source's DDL verbatim, collection ids
+// included, and it is meant to run once against a newly deployed secondary.
+// Restoring on top of a collection that is already there does not replace it:
+// the create is skipped and the data is imported into the existing collection,
+// which silently doubles its rows.
+func (t *Task) checkTargetIsUnused(ctx context.Context) error {
+	var present []string
+	// Databases the backup will create do not exist on the target yet; that is
+	// the expected state for a newly deployed secondary, so it is reported once
+	// per database and without the error object, which otherwise reads as a
+	// failure. Any other error is a real inability to check and is warned.
+	skipped := make(map[string]int)
+	for _, coll := range t.args.Backup.GetCollectionBackups() {
+		name := fmt.Sprintf("%s.%s", coll.GetDbName(), coll.GetCollectionName())
+		has, err := t.grpc.HasCollection(ctx, coll.GetDbName(), coll.GetCollectionName())
+		if err != nil {
+			if isDatabaseNotFound(err) {
+				skipped[coll.GetDbName()]++
+				continue
+			}
+			t.logger.Warn("cannot check whether the target already holds a collection, continuing",
+				zap.String("coll", name), zap.Error(err))
+			continue
+		}
+		if has {
+			present = append(present, name)
+		}
+	}
+	dbs := make([]string, 0, len(skipped))
+	for db := range skipped {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	for _, db := range dbs {
+		t.logger.Info("database does not exist on the target yet, as expected for a newly deployed secondary; skipping the duplicate-collection check for it",
+			zap.String("db", db), zap.Int("collections", skipped[db]))
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	return fmt.Errorf("secondary: the target already holds %v, so it is not a newly "+
+		"deployed secondary. A secondary restore replays the source's DDL with the "+
+		"source's collection ids and is meant to run once: restoring on top of an "+
+		"existing collection does not replace it, it imports into it and doubles its "+
+		"rows. Dropping those collections does not make the target usable either, "+
+		"because their ids stay reserved while they are reclaimed and a restore of the "+
+		"same ids is then discarded without an error. To bootstrap again, deploy a new "+
+		"secondary and restore into that", present)
+}
+
+// isDatabaseNotFound reports whether err is Milvus saying the database does not
+// exist. The client surfaces it as a wrapped status error, so match the text.
+func isDatabaseNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "database not found")
+}
+
+// verifyRestored confirms the collections actually exist on the target.
+//
+// Every step of this restore reports on whether the messages it sent were
+// accepted, not on what the target did with them. The target can accept them
+// and still create nothing -- a collection id left reserved by an earlier,
+// reclaimed collection makes the replayed create a silent no-op -- so without
+// this check the restore reports success against an empty target.
+func (t *Task) verifyRestored(ctx context.Context) error {
+	deadline := time.Now().Add(_restoreVerifyTimeout)
+	var missing []string
+	for {
+		missing = missing[:0]
+		for _, coll := range t.args.Backup.GetCollectionBackups() {
+			has, err := t.grpc.HasCollection(ctx, coll.GetDbName(), coll.GetCollectionName())
+			if err != nil {
+				return fmt.Errorf("secondary: verify restored collection %s.%s: %w",
+					coll.GetDbName(), coll.GetCollectionName(), err)
+			}
+			if !has {
+				missing = append(missing, fmt.Sprintf("%s.%s",
+					coll.GetDbName(), coll.GetCollectionName()))
+			}
+		}
+		if len(missing) == 0 {
+			t.logger.Info("all restored collections are present on the target")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		// The DDL is applied asynchronously on the target, so give it a moment
+		// before concluding that it never arrived.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(_restoreVerifyInterval):
+		}
+	}
+	return fmt.Errorf("secondary: the restore reported no errors, but %v %s not present on "+
+		"the target after %s. The messages were accepted and nothing was created, which "+
+		"happens when the target is not a newly deployed secondary: a collection id that "+
+		"an earlier collection still holds while it is being reclaimed makes the replayed "+
+		"create a silent no-op. Deploy a new secondary and restore into that",
+		missing, plural(len(missing)), _restoreVerifyTimeout)
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
+}
+
+func (t *Task) runDBTasks(ctx context.Context) error {
+	args := databaseTaskArgs{
+		TaskID:     t.args.TaskID,
+		BackupInfo: t.args.Backup,
+		StreamCli:  t.streamCli,
+	}
+
+	for _, db := range t.args.Backup.GetDatabaseBackups() {
+		task, err := newDatabaseTask(args, db)
+		if err != nil {
+			return fmt.Errorf("secondary: create database task: %w", err)
+		}
+
+		if err := task.Execute(ctx); err != nil {
+			return fmt.Errorf("secondary: execute database task: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// pchTS reads each physical channel's flush boundary off the flush-all
+// messages the backup captured. They are the source positions the restore's
+// replay anchors the secondary's replication checkpoint at, so both data paths
+// cut their imports there: the binlog batches by passing the bound as end_ts,
+// the snapshot bundle by handing the whole map to the target.
+func (t *Task) pchTS() (map[string]uint64, error) {
+	pchTS := make(map[string]uint64, len(t.args.Backup.GetFlushAllMsgsBase64()))
+	for pch, msgBase64 := range t.args.Backup.GetFlushAllMsgsBase64() {
+		msyBytes, err := base64.StdEncoding.DecodeString(msgBase64)
+		if err != nil {
+			return nil, fmt.Errorf("secondary: decode flush all msg: %w", err)
+		}
+
+		var msg commonpb.ImmutableMessage
+		if err := proto.Unmarshal(msyBytes, &msg); err != nil {
+			return nil, fmt.Errorf("secondary: unmarshal flush all msg: %w", err)
+		}
+
+		ts, err := milvus.GetTT(&msg)
+		if err != nil {
+			return nil, fmt.Errorf("secondary: get tt from flush all msg: %w", err)
+		}
+
+		pchTS[pch] = ts
+	}
+
+	return pchTS, nil
+}
+
+func (t *Task) binlogDMLTaskArgs() (binlogDMLTaskArgs, error) {
+	pchTS, err := t.pchTS()
+	if err != nil {
+		return binlogDMLTaskArgs{}, err
+	}
+
+	streaming := false
+	if t.args.MilvusStorage != nil {
+		streaming = storage.UseStreaming(t.args.Params.Transfer.Mode.Val,
+			t.args.BackupStorage.Config(), t.args.MilvusStorage.Config())
+	}
+
+	return binlogDMLTaskArgs{
+		TaskID: t.args.TaskID,
+
+		PchTS: pchTS,
+
+		BackupStorage: t.args.BackupStorage,
+		BackupDir:     t.args.BackupDir,
+
+		MilvusStorage:  t.args.MilvusStorage,
+		MilvusRootPath: t.args.Params.Milvus.Storage.RootPath.Val,
+		Streaming:      streaming,
+		CopySem:        semaphore.NewWeighted(int64(t.args.Params.Transfer.Concurrency.Val)),
+
+		StreamCli:  t.streamCli,
+		RestfulCli: t.restful,
+	}, nil
+}
+
+func (t *Task) ddlTaskArgs() ddlTaskArgs {
+	return ddlTaskArgs{
+		TaskID:     t.args.TaskID,
+		BackupInfo: t.args.Backup,
+		StreamCli:  t.streamCli,
+	}
+}
+
+func (t *Task) runCollTask(ctx context.Context, dbBackup *backuppb.DatabaseBackupInfo, collBackup *backuppb.CollectionBackupInfo, ddlArgs ddlTaskArgs, dml tasklet.Tasklet, loadArgs loadTaskArgs) error {
+	collRef := collref.New(dbBackup.GetDbName(), collBackup.GetCollectionName())
+	collTracker := t.tracker.NewCollTracker(collRef, collBackup.GetSize())
+	ddlTracker := collTracker.DDL()
+	// The copy half covers everything past the schema: the create wait, the
+	// data replay and the load. It moves bytes through this process on the
+	// binlog path and hands the target a bundle to read on the snapshot path,
+	// so there is no server-side job id to bind either way.
+	copyJob := collTracker.NewJob(collBackup.GetSize())
+
+	ddlTracker.SetExecuting()
+	ddlTask := newCollDDLTask(ddlArgs, dbBackup, collBackup)
+	if err := ddlTask.Execute(ctx); err != nil {
+		ddlTracker.SetFail(err)
+		return fmt.Errorf("secondary: execute collection ddl task: %w", err)
+	}
+	ddlTracker.SetSuccess()
+
+	copyJob.SetRunning()
+	if err := t.waitCollCreated(ctx, collRef, collBackup.GetCollectionId()); err != nil {
+		copyJob.SetFailed(err)
+		return err
+	}
+
+	if err := dml.Execute(ctx); err != nil {
+		copyJob.SetFailed(err)
+		return fmt.Errorf("secondary: execute collection dml task: %w", err)
+	}
+
+	loadTask := newCollLoadTask(loadArgs, dbBackup, collBackup)
+	if err := loadTask.Execute(ctx); err != nil {
+		copyJob.SetFailed(err)
+		return fmt.Errorf("secondary: execute collection load task: %w", err)
+	}
+
+	copyJob.SetCompleted()
+
+	return nil
+}
+
+// waitCollCreated blocks until the collection this restore just created is
+// usable on the target, and fails the collection if it never becomes so.
+//
+// The DDL is not applied where it is sent. createColl returns once the create
+// message is queued for the target's replicate stream, which says nothing about
+// whether the target has accepted it, let alone applied it. Everything after it
+// -- the import above all -- depends on the collection actually being there, and
+// an import submitted against a collection the target does not have is accepted
+// and then killed partway through, reported as the collection having been
+// dropped. Waiting here turns that into a failure at the point of the cause.
+func (t *Task) waitCollCreated(ctx context.Context, collRef collref.Name, collectionID int64) error {
+	deadline := time.Now().Add(_collCreateTimeout)
+	for {
+		has, err := t.grpc.HasCollectionByID(ctx, collectionID)
+		if err != nil {
+			return fmt.Errorf("secondary: wait for collection %s (id %d): %w", collRef, collectionID, err)
+		}
+		if has {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(_collCreateInterval):
+		}
+	}
+
+	return fmt.Errorf("secondary: collection %s (id %d) is still not on the target %s after "+
+		"its create was sent, so the create had no effect. A secondary restore replays the "+
+		"source's create with the source's collection id, and the target keeps that id "+
+		"reserved for as long as a collection that held it is being reclaimed -- dropping "+
+		"the collections on the target does not release their ids, and a create of a "+
+		"reserved id is discarded without an error. Restore into a newly deployed "+
+		"secondary, and check with birdwatcher that none of the backup's collection ids "+
+		"are present there in any state, dropped included",
+		collRef, collectionID, _collCreateTimeout)
+}
+
+func (t *Task) loadTaskArgs() loadTaskArgs {
+	return loadTaskArgs{
+		TaskID:     t.args.TaskID,
+		BackupInfo: t.args.Backup,
+		StreamCli:  t.streamCli,
+	}
+}
+
+func (t *Task) runCollTasks(ctx context.Context) error {
+	dbNameBackup := make(map[string]*backuppb.DatabaseBackupInfo, len(t.args.Backup.GetDatabaseBackups()))
+	for _, db := range t.args.Backup.GetDatabaseBackups() {
+		dbNameBackup[db.GetDbName()] = db
+	}
+
+	newDML, err := t.newCollDMLTaskFactory()
+	if err != nil {
+		return err
+	}
+	ddlArgs := t.ddlTaskArgs()
+	loadArgs := t.loadTaskArgs()
+
+	g, subCtx := errgroup.WithContext(ctx)
+	g.SetLimit(t.args.Params.Restore.Concurrency.Collections.Val)
+	for _, coll := range t.args.Backup.GetCollectionBackups() {
+		g.Go(func() error {
+			dml, err := newDML(coll)
+			if err != nil {
+				return fmt.Errorf("secondary: create collection dml task: %w", err)
+			}
+			return t.runCollTask(subCtx, dbNameBackup[coll.GetDbName()], coll, ddlArgs, dml, loadArgs)
+		})
+	}
+
+	return g.Wait()
+}
+
+// collDMLTaskFactory builds the data half of one collection.
+type collDMLTaskFactory func(collBackup *backuppb.CollectionBackupInfo) (tasklet.Tasklet, error)
+
+// newCollDMLTaskFactory picks the data half's shape from the backup's format:
+// binlog batches, each replayed as its own import message, or the snapshot
+// bundle replayed as the single import message the target expands itself.
+// What every collection shares — the binlog path's copy semaphore above all —
+// is built here, once, and the factory only reads it.
+func (t *Task) newCollDMLTaskFactory() (collDMLTaskFactory, error) {
+	if t.args.Backup.GetFormat() == meta.FormatSnapshot {
+		pchTS, err := t.pchTS()
+		if err != nil {
+			return nil, fmt.Errorf("secondary: get flush all ts: %w", err)
+		}
+		args := snapDMLTaskArgs{
+			TaskID: t.args.TaskID, PchTS: pchTS,
+			StreamCli: t.streamCli, RestfulCli: t.restful,
+		}
+		return func(collBackup *backuppb.CollectionBackupInfo) (tasklet.Tasklet, error) {
+			metadataURI, err := t.snapSource.MetadataURI(collBackup.GetSnapshotBackup().GetMetadataPath())
+			if err != nil {
+				return nil, fmt.Errorf("secondary: resolve the bundle metadata uri: %w", err)
+			}
+			layout := t.snapLayouts[collBackup.GetCollectionId()]
+			return newCollSnapDMLTask(args, collBackup, metadataURI, t.snapSource.ExternalSpec, layout)
+		}, nil
+	}
+
+	dmlArgs, err := t.binlogDMLTaskArgs()
+	if err != nil {
+		return nil, fmt.Errorf("secondary: get dml task args: %w", err)
+	}
+	return func(collBackup *backuppb.CollectionBackupInfo) (tasklet.Tasklet, error) {
+		return newCollBinlogDMLTask(dmlArgs, collBackup), nil
+	}, nil
+}
+
+// _storageV3 is the storage version the snapshot import reads; it is the
+// server's constant, which is not importable.
+const _storageV3 int64 = 3
+
+// checkSnapshotBundles reads every bundle of a snapshot backup before any DDL
+// is broadcast and refuses what the target's snapshot import would refuse
+// after it: a data segment written in a storage version other than V3. The
+// import expands a bundle on the target only once its job is pending, which is
+// after the collection — and every collection replayed before it — exists on
+// the secondary, and a secondary that got that far has to be redeployed (see
+// checkTargetIsUnused). Refusing here costs a read of the bundle's manifests
+// instead. The same read settles each bundle's layout, which its import
+// message has to name, so the data tasks never touch the backup again.
+func (t *Task) checkSnapshotBundles(ctx context.Context) error {
+	if t.args.Backup.GetFormat() != meta.FormatSnapshot {
+		return nil
+	}
+
+	store := snapshotbundle.NewStorageStore(t.args.BackupStorage)
+	t.snapLayouts = make(map[int64]datapb.SnapshotLayout, len(t.args.Backup.GetCollectionBackups()))
+	var legacy []string
+	for _, coll := range t.args.Backup.GetCollectionBackups() {
+		name := fmt.Sprintf("%s.%s", coll.GetDbName(), coll.GetCollectionName())
+		key := path.Join(t.args.BackupDir, coll.GetSnapshotBackup().GetMetadataPath())
+		snapshot, err := snapshotbundle.LoadSnapshotData(ctx, store, key, true)
+		if err != nil {
+			return fmt.Errorf("secondary: read the bundle of %s at %s: %w", name, key, err)
+		}
+		t.snapLayouts[coll.GetCollectionId()] = snapshot.Layout
+
+		for _, segment := range snapshot.Segments {
+			// L0 segments carry deletes, which the import folds on its own; only
+			// the data segments are read in their storage format.
+			if segment.GetSegmentLevel() == datapb.SegmentLevel_L0 || segment.GetStorageVersion() == _storageV3 {
+				continue
+			}
+			legacy = append(legacy, fmt.Sprintf("%s/%d (storage version %d)", name, segment.GetSegmentId(), segment.GetStorageVersion()))
+		}
+	}
+	if len(legacy) == 0 {
+		t.logger.Info("all snapshot bundles read, every data segment is StorageV3", zap.Int("collections", len(t.snapLayouts)))
+		return nil
+	}
+
+	// Name a handful, so the message points at the collections without
+	// listing every segment of a large backup.
+	const shown = 5
+	more := ""
+	if len(legacy) > shown {
+		more = fmt.Sprintf(" and %d more", len(legacy)-shown)
+		legacy = legacy[:shown]
+	}
+	return fmt.Errorf("secondary: a snapshot format backup replays through the target's snapshot import, "+
+		"which reads StorageV3 segments only, but this backup carries data segments written in another "+
+		"storage version: %s%s. Nothing has been sent to the target. Take the backup in the binlog format "+
+		"instead (create --for secondary), or have the source write StorageV3 segments "+
+		"(common.storage.useLoonFFI) before the data is written and back it up again",
+		strings.Join(legacy, ", "), more)
+}
+
+func (t *Task) sendRBACMsg(ctx context.Context) error {
+	t.logger.Info("send rbac msg")
+	curRBAC, err := t.grpc.BackupRBAC(context.Background())
+	if err != nil {
+		return fmt.Errorf("secondary: get current rbac: %w", err)
+	}
+
+	users := conv.Users(t.args.Backup.GetRbacMeta().GetUsers(), curRBAC.GetRBACMeta().GetUsers())
+	roles := conv.Roles(t.args.Backup.GetRbacMeta().GetRoles(), curRBAC.GetRBACMeta().GetRoles())
+	grants := conv.Grants(t.args.Backup.GetRbacMeta().GetGrants(), curRBAC.GetRBACMeta().GetGrants())
+	privilegeGroups := conv.PrivilegeGroups(t.args.Backup.GetRbacMeta().GetPrivilegeGroups(), curRBAC.GetRBACMeta().GetPrivilegeGroups())
+
+	rbacMeta := &milvuspb.RBACMeta{
+		Users:           users,
+		Roles:           roles,
+		Grants:          grants,
+		PrivilegeGroups: privilegeGroups,
+	}
+
+	builder := message.NewRestoreRBACMessageBuilderV2().
+		WithHeader(&message.RestoreRBACMessageHeader{}).
+		WithBody(&message.RestoreRBACMessageBody{RbacMeta: rbacMeta}).
+		WithBroadcast([]string{t.args.Backup.GetControlChannelName()})
+
+	err = t.streamCli.Send(ctx, func(uint64) []message.MutableMessage {
+		broadcast := builder.MustBuildBroadcast().WithBroadcastID(rand.Uint64())
+		return broadcast.SplitIntoMutableMessage()
+	})
+	if err != nil {
+		return fmt.Errorf("secondary: send rbac msg: %w", err)
+	}
+
+	return nil
+}
+
+func (t *Task) sendFlushAll(ctx context.Context) error {
+	t.logger.Info("send flush all msg")
+
+	for _, msgBase64 := range t.args.Backup.GetFlushAllMsgsBase64() {
+		msyBytes, err := base64.StdEncoding.DecodeString(msgBase64)
+		if err != nil {
+			return fmt.Errorf("secondary: decode flush all msg: %w", err)
+		}
+
+		var msg commonpb.ImmutableMessage
+		if err := proto.Unmarshal(msyBytes, &msg); err != nil {
+			return fmt.Errorf("secondary: unmarshal flush all msg: %w", err)
+		}
+
+		if err := t.streamCli.Forward(ctx, &msg); err != nil {
+			return fmt.Errorf("secondary: send flush all msg: %w", err)
+		}
+	}
+
+	t.logger.Info("send flush all msg done")
+
+	return nil
+}

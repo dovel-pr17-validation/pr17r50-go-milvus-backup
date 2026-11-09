@@ -1,0 +1,101 @@
+package restore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/spf13/cobra"
+
+	"github.com/zilliztech/milvus-backup/app"
+	"github.com/zilliztech/milvus-backup/cmd/root"
+	"github.com/zilliztech/milvus-backup/internal/cfg"
+	"github.com/zilliztech/milvus-backup/internal/jobstate"
+)
+
+type secondaryOption struct {
+	backupName string
+
+	sourceClusterID string
+	targetClusterID string
+}
+
+func (o *secondaryOption) addCmd(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&o.backupName, "name", "n", "", "backup name")
+
+	cmd.Flags().StringVarP(&o.sourceClusterID, "source_cluster_id", "", "", "source cluster id")
+	cmd.Flags().StringVarP(&o.targetClusterID, "target_cluster_id", "", "", "target cluster id")
+}
+
+func (o *secondaryOption) validate() error {
+	if len(o.sourceClusterID) == 0 {
+		return errors.New("empty source cluster id")
+	}
+	if len(o.targetClusterID) == 0 {
+		return errors.New("empty target cluster id")
+	}
+
+	return nil
+}
+
+func (o *secondaryOption) toRequest() app.RestoreSecondaryRequest {
+	return app.RestoreSecondaryRequest{
+		TaskID: uuid.NewString(),
+
+		BackupName: o.backupName,
+
+		SourceClusterID: o.sourceClusterID,
+		TargetClusterID: o.targetClusterID,
+	}
+}
+
+func (o *secondaryOption) run(cmd *cobra.Command, params *cfg.Config) error {
+	ctx := context.Background()
+	store := jobstate.Default()
+	job, err := app.NewRestoreSecondaryJob(ctx, params, store, o.toRequest())
+	if err != nil {
+		return fmt.Errorf("restore: new restore secondary job: %w", err)
+	}
+
+	job.Run(ctx)
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("restore: wait restore secondary job: %w", err)
+	}
+	if status.State == jobstate.RestoreStateFail {
+		return fmt.Errorf("restore: run restore secondary job: %s", status.ErrorMessage)
+	}
+
+	return nil
+}
+
+func newSecondaryCmd(opt *root.Options) *cobra.Command {
+	var o secondaryOption
+	cmd := &cobra.Command{
+		Use:   "secondary",
+		Short: "restore a backup to a secondary cluster",
+		Long: "Restore a backup to a newly deployed secondary cluster.\n\n" +
+			"Keep CDC stopped until restore succeeds. Every target channel must have a zero\n" +
+			"checkpoint from the expected source; this check does not block CDC.\n\n" +
+			"Create the backup with:\n\n" +
+			"  milvus-backup create -n my_backup --for secondary\n\n" +
+			"Setup and limits: docs/user_guide/secondary_restore.md",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			params := opt.InitGlobalVars()
+
+			if err := o.validate(); err != nil {
+				return err
+			}
+
+			err := o.run(cmd, params)
+			cobra.CheckErr(err)
+
+			return nil
+		},
+	}
+
+	o.addCmd(cmd)
+
+	return cmd
+}

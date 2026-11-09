@@ -1,0 +1,1365 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "A data backup \u0026 restore tool for Milvus",
+        "title": "Milvus Backup Service",
+        "contact": {},
+        "license": {
+            "name": "Apache 2.0",
+            "url": "http://www.apache.org/licenses/LICENSE-2.0.html"
+        },
+        "version": "1.0"
+    },
+    "basePath": "/api/v1",
+    "paths": {
+        "/create": {
+            "post": {
+                "description": "Create a backup with the given name and collections\nStorage preflight failures return HTTP 200 with code 503 (Storage_Not_Ready), without registering a task. The caller may retry the same request.\nA backup name whose artifact directory already exists fails with code Fail, also without registering a task.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Backup"
+                ],
+                "summary": "Create backup interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "description": "CreateBackupRequest JSON",
+                        "name": "object",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.CreateBackupRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.BackupInfoResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/delete": {
+            "delete": {
+                "description": "Delete a backup with the given name",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Backup"
+                ],
+                "summary": "Delete backup interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "backup_name",
+                        "name": "backup_name",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.DeleteBackupResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/get_backup": {
+            "get": {
+                "description": "Get the backup with the given name or id",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Backup"
+                ],
+                "summary": "Get backup interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "backup_name",
+                        "name": "backup_name",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "backup_id",
+                        "name": "backup_id",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.BackupInfoResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/get_restore": {
+            "get": {
+                "description": "Get restore task state with the given id",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Restore"
+                ],
+                "summary": "Get restore interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "id",
+                        "name": "id",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.RestoreBackupResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/list": {
+            "get": {
+                "description": "List all backups in current storage",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Backup"
+                ],
+                "summary": "List Backups interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "collection_name",
+                        "name": "collection_name",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.ListBackupsResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/restore": {
+            "post": {
+                "description": "Submit a request to restore the data from backup",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Restore"
+                ],
+                "summary": "Restore interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "description": "RestoreBackupRequest JSON",
+                        "name": "object",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.RestoreBackupRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.RestoreBackupResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/restore_secondary": {
+            "post": {
+                "description": "Submit a request to restore the data from backup",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Restore"
+                ],
+                "summary": "Restore interface",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "request_id",
+                        "name": "request_id",
+                        "in": "header"
+                    },
+                    {
+                        "description": "RestoreSecondaryRequest JSON",
+                        "name": "object",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.RestoreSecondaryRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apiv1.RestoreBackupResponse"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "apiv1.BackupInfoBrief": {
+            "type": "object",
+            "properties": {
+                "backup_timestamp": {
+                    "type": "integer"
+                },
+                "collection_backups": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.CollectionBackupInfoBrief"
+                    }
+                },
+                "database_backups": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.DatabaseBackupInfo"
+                    }
+                },
+                "end_time": {
+                    "type": "integer"
+                },
+                "errorMessage": {
+                    "type": "string"
+                },
+                "format": {
+                    "description": "See BackupInfo.format.",
+                    "type": "string"
+                },
+                "id": {
+                    "description": "From the task.",
+                    "type": "string"
+                },
+                "meta_size": {
+                    "description": "Sum of all meta files size.",
+                    "type": "integer"
+                },
+                "milvus_version": {
+                    "type": "string"
+                },
+                "name": {
+                    "description": "From the backup meta.",
+                    "type": "string"
+                },
+                "progress": {
+                    "type": "integer"
+                },
+                "rpc_channel_info": {
+                    "$ref": "#/definitions/backuppb.RPCChannelInfo"
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "start_time": {
+                    "type": "integer"
+                },
+                "state_code": {
+                    "$ref": "#/definitions/backuppb.BackupTaskStateCode"
+                }
+            }
+        },
+        "apiv1.BackupInfoResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Response code. 0 means success, others fail. Absent on success.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/backuppb.ResponseCode"
+                        }
+                    ]
+                },
+                "data": {
+                    "description": "Backup info entity; null when the response carries none.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/apiv1.BackupInfoBrief"
+                        }
+                    ]
+                },
+                "msg": {
+                    "description": "Error msg if fail.",
+                    "type": "string"
+                },
+                "requestId": {
+                    "description": "Uuid of the request answered.",
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.BackupSummary": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "milvus_version": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                }
+            }
+        },
+        "apiv1.CollFilter": {
+            "type": "object",
+            "properties": {
+                "colls": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "apiv1.CollectionBackupInfoBrief": {
+            "type": "object",
+            "properties": {
+                "backup_physical_timestamp": {
+                    "description": "Physical unix time of backup.",
+                    "type": "integer"
+                },
+                "backup_timestamp": {
+                    "description": "Logical time of backup, used for restore.",
+                    "type": "integer"
+                },
+                "channel_checkpoints": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "collection_id": {
+                    "type": "integer"
+                },
+                "collection_name": {
+                    "type": "string"
+                },
+                "db_name": {
+                    "type": "string"
+                },
+                "has_index": {
+                    "type": "boolean"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "index_infos": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.IndexInfo"
+                    }
+                },
+                "load_state": {
+                    "type": "string"
+                },
+                "properties": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "schema": {
+                    "$ref": "#/definitions/backuppb.CollectionSchema"
+                },
+                "shards_num": {
+                    "type": "integer"
+                },
+                "size": {
+                    "type": "integer"
+                }
+            }
+        },
+        "apiv1.CreateBackupRequest": {
+            "type": "object",
+            "properties": {
+                "async": {
+                    "description": "Async or not: return after the job is registered instead of waiting for\nit to settle.",
+                    "type": "boolean"
+                },
+                "backup_name": {
+                    "description": "Backup name, validated server-side: numbers, letters and underscores.",
+                    "type": "string"
+                },
+                "backup_root_path": {
+                    "description": "Backup root path, overriding the config for this call.",
+                    "type": "string"
+                },
+                "collection_names": {
+                    "description": "Collection names to backup, empty to backup all.\n\nDeprecated: use filter.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "db_collections": {
+                    "description": "Database and collections to backup. Accepts both shapes it always has:\na JSON string holding a JSON object, or the object itself.\n\nDeprecated: use filter.",
+                    "type": "string"
+                },
+                "drop_snapshot_if_exists": {
+                    "description": "Drop a snapshot of the same name before creating the backup's own, so a\nleftover from an earlier run that died mid-flight cannot fail the create.\nSnapshot format only.",
+                    "type": "boolean"
+                },
+                "filter": {
+                    "description": "Filter for backup: database name to its collection list.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/apiv1.CollFilter"
+                    }
+                },
+                "force": {
+                    "description": "Force backup skip flush. Data must already be on disk when using it.\n\nDeprecated: set strategy=skip_flush instead.",
+                    "type": "boolean"
+                },
+                "format": {
+                    "description": "Format for backup, one of [auto, binlog, snapshot]; auto selects when\nunset.",
+                    "type": "string"
+                },
+                "gc_pause_address": {
+                    "description": "Gc pause API address.",
+                    "type": "string"
+                },
+                "gc_pause_enable": {
+                    "description": "Stop GC during the backup so the data to backup is not compacted or\nGCed away; use it when the data is very large.",
+                    "type": "boolean"
+                },
+                "gc_pause_seconds": {
+                    "description": "Gc pause seconds, set it larger than the time cost of the backup.\n\nDeprecated: the server derives it from the config.",
+                    "type": "integer"
+                },
+                "meta_only": {
+                    "description": "Only backup meta, including collection schema and index info.\n\nDeprecated: set strategy=meta_only instead.",
+                    "type": "boolean"
+                },
+                "rbac": {
+                    "description": "Whether backup RBAC.",
+                    "type": "boolean"
+                },
+                "requestId": {
+                    "description": "Uuid of request, defaults to a generated one when unset.",
+                    "type": "string"
+                },
+                "strategy": {
+                    "description": "Strategy for backup, one of [meta_only, skip_flush, bulk_flush,\nserial_flush]; auto selects when unset.",
+                    "type": "string"
+                },
+                "with_index_extra": {
+                    "description": "Also copy index-extra params (build_level and friends) verbatim.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "apiv1.DeleteBackupResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Response code. 0 means success, others fail. Absent on success.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/backuppb.ResponseCode"
+                        }
+                    ]
+                },
+                "msg": {
+                    "description": "Error msg if fail.",
+                    "type": "string"
+                },
+                "requestId": {
+                    "description": "Uuid of the request answered.",
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.ListBackupsResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Response code. 0 means success, others fail. Absent on success.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/backuppb.ResponseCode"
+                        }
+                    ]
+                },
+                "data": {
+                    "description": "Backup info entities; null when there are none.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.BackupSummary"
+                    }
+                },
+                "msg": {
+                    "description": "Error msg if fail.",
+                    "type": "string"
+                },
+                "requestId": {
+                    "description": "Uuid of the request answered.",
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.RestoreBackupRequest": {
+            "type": "object",
+            "properties": {
+                "async": {
+                    "description": "Execute asynchronously: return after the job is registered.",
+                    "type": "boolean"
+                },
+                "backup_name": {
+                    "description": "Backup name to restore.",
+                    "type": "string"
+                },
+                "bucket_name": {
+                    "description": "Bucket name; with path, overrides the config for this call.",
+                    "type": "string"
+                },
+                "collection_names": {
+                    "description": "Collections to restore.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "collection_renames": {
+                    "description": "Rename the restored collections by map; wins over collection_suffix.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "collection_suffix": {
+                    "description": "Rename the restored collections by appending a suffix.",
+                    "type": "string"
+                },
+                "db_collections": {
+                    "description": "Database and collections to restore, for example\n{\"db1\":[\"collection1\"],\"db2\":[\"collection2\",\"collection3\"]}. Accepts\nboth shapes it always has: a JSON string holding a JSON object, or the\nobject itself.",
+                    "type": "string"
+                },
+                "db_collections_after_rename": {
+                    "description": "Which database and collections to restore after rename. Accepts both\nshapes db_collections accepts.",
+                    "type": "string"
+                },
+                "dropExistCollection": {
+                    "description": "Drop existing target collection before create.",
+                    "type": "boolean"
+                },
+                "dropExistIndex": {
+                    "description": "Drop existing index of target collection before create.",
+                    "type": "boolean"
+                },
+                "ezkMapping": {
+                    "description": "Map of old ezk to new ezk, replacing encryption keys during restore.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "id": {
+                    "description": "Restore task id, defaults to a generated one when unset.",
+                    "type": "string"
+                },
+                "maxShardNum": {
+                    "description": "Target max shard number.",
+                    "type": "integer"
+                },
+                "metaOnly": {
+                    "description": "Only restore meta, not data.",
+                    "type": "boolean"
+                },
+                "path": {
+                    "description": "Path; with bucket_name, overrides the config for this call.",
+                    "type": "string"
+                },
+                "rbac": {
+                    "description": "Whether restore RBAC.",
+                    "type": "boolean"
+                },
+                "requestId": {
+                    "description": "Uuid of request, defaults to a generated one when unset.",
+                    "type": "string"
+                },
+                "restoreIndex": {
+                    "description": "Restore index info.",
+                    "type": "boolean"
+                },
+                "restorePlan": {
+                    "description": "Per-database restore plan with renames and a task filter.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/apiv1.RestorePlan"
+                        }
+                    ]
+                },
+                "secondaries": {
+                    "description": "Secondary clusters that replicate this target. Each item carries its REST\naddress and optional raw token; when set, every import job is committed\ntwo-phase so its mirror commits on every secondary.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.Secondary"
+                    }
+                },
+                "skipCreateCollection": {
+                    "description": "Skip collection create; use when the collection exists and only index\nor data is restored.",
+                    "type": "boolean"
+                },
+                "skipImportDiskQuotaCheck": {
+                    "description": "Skip the disk quota check in import.\n\nDeprecated: the check follows the config.",
+                    "type": "boolean"
+                },
+                "skipParams": {
+                    "description": "Skip the named params in the restore process.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/apiv1.SkipParams"
+                        }
+                    ]
+                },
+                "strategy": {
+                    "description": "Strategy for restore, one of [auto, per_seg, merged_seg, restore_snap,\nimport_snap]; auto, like leaving the field unset, lets the restore pick\nthe plan against the backup's format.",
+                    "type": "string"
+                },
+                "truncateBinlogByTs": {
+                    "description": "Truncate binlog by timestamp, for cdc.",
+                    "type": "boolean"
+                },
+                "useAutoIndex": {
+                    "description": "Use autoindex when restoring vector index.",
+                    "type": "boolean"
+                },
+                "useV2Restore": {
+                    "description": "Deprecated: set strategy=merged_seg instead.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "apiv1.RestoreBackupResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Response code. 0 means success, others fail. Absent on success.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/backuppb.ResponseCode"
+                        }
+                    ]
+                },
+                "data": {
+                    "description": "Restore task info entity; null when the response carries none.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/apiv1.RestoreBackupTaskResponse"
+                        }
+                    ]
+                },
+                "msg": {
+                    "description": "Error msg if fail.",
+                    "type": "string"
+                },
+                "requestId": {
+                    "description": "Uuid of the request answered; absent on the failures a request answers\nbefore its id is known.",
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.RestoreBackupTaskResponse": {
+            "type": "object",
+            "properties": {
+                "collection_restore_tasks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.RestoreCollectionTaskResponse"
+                    }
+                },
+                "end_time": {
+                    "type": "integer"
+                },
+                "errorMessage": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "progress": {
+                    "type": "integer"
+                },
+                "start_time": {
+                    "type": "integer"
+                },
+                "state_code": {
+                    "$ref": "#/definitions/backuppb.RestoreTaskStateCode"
+                }
+            }
+        },
+        "apiv1.RestoreCollectionMapping": {
+            "type": "object",
+            "properties": {
+                "override": {
+                    "$ref": "#/definitions/apiv1.RestoreCollectionOverride"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "target": {
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.RestoreCollectionOverride": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "shardNum": {
+                    "type": "integer"
+                }
+            }
+        },
+        "apiv1.RestoreCollectionTaskResponse": {
+            "type": "object",
+            "properties": {
+                "end_time": {
+                    "type": "integer"
+                },
+                "errorMessage": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "progress": {
+                    "type": "integer"
+                },
+                "start_time": {
+                    "type": "integer"
+                },
+                "state_code": {
+                    "$ref": "#/definitions/backuppb.RestoreTaskStateCode"
+                },
+                "target_collection_name": {
+                    "type": "string"
+                },
+                "target_db_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.RestoreMapping": {
+            "type": "object",
+            "properties": {
+                "colls": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.RestoreCollectionMapping"
+                    }
+                },
+                "source": {
+                    "description": "Source database name; empty is an error.",
+                    "type": "string"
+                },
+                "target": {
+                    "description": "Target database name.",
+                    "type": "string"
+                },
+                "withProp": {
+                    "description": "Whether to restore with the source properties.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "apiv1.RestorePlan": {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/apiv1.CollFilter"
+                    }
+                },
+                "mapping": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/apiv1.RestoreMapping"
+                    }
+                }
+            }
+        },
+        "apiv1.RestoreSecondaryRequest": {
+            "type": "object",
+            "properties": {
+                "async": {
+                    "description": "Async or not: return after the job is registered instead of waiting for\nit to settle.",
+                    "type": "boolean"
+                },
+                "backup_name": {
+                    "description": "Backup name to restore.",
+                    "type": "string"
+                },
+                "path": {
+                    "description": "Path, overriding the config for this call.",
+                    "type": "string"
+                },
+                "requestId": {
+                    "description": "Uuid of request; doubles as the restore task id.",
+                    "type": "string"
+                },
+                "sourceClusterID": {
+                    "description": "Cdc source cluster id.",
+                    "type": "string"
+                },
+                "targetClusterID": {
+                    "description": "Cdc target cluster id.",
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.Secondary": {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "apiv1.SkipParams": {
+            "type": "object",
+            "properties": {
+                "collectionProperties": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "fieldIndexParams": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "fieldTypeParams": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "indexParams": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "backuppb.BackupTaskStateCode": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2,
+                3,
+                4
+            ],
+            "x-enum-varnames": [
+                "BackupTaskStateCode_BACKUP_INITIAL",
+                "BackupTaskStateCode_BACKUP_EXECUTING",
+                "BackupTaskStateCode_BACKUP_SUCCESS",
+                "BackupTaskStateCode_BACKUP_FAIL",
+                "BackupTaskStateCode_BACKUP_TIMEOUT"
+            ]
+        },
+        "backuppb.CollectionSchema": {
+            "type": "object",
+            "properties": {
+                "autoID": {
+                    "type": "boolean"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "enable_dynamic_field": {
+                    "type": "boolean"
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.FieldSchema"
+                    }
+                },
+                "functions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.FunctionSchema"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "properties": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "struct_array_fields": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.StructArrayFieldSchema"
+                    }
+                }
+            }
+        },
+        "backuppb.DataType": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                10,
+                11,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                100,
+                101,
+                102,
+                103,
+                104,
+                105,
+                106,
+                200,
+                201
+            ],
+            "x-enum-varnames": [
+                "DataType_None",
+                "DataType_Bool",
+                "DataType_Int8",
+                "DataType_Int16",
+                "DataType_Int32",
+                "DataType_Int64",
+                "DataType_Float",
+                "DataType_Double",
+                "DataType_String",
+                "DataType_VarChar",
+                "DataType_Array",
+                "DataType_JSON",
+                "DataType_Geometry",
+                "DataType_Text",
+                "DataType_Timestamptz",
+                "DataType_BinaryVector",
+                "DataType_FloatVector",
+                "DataType_Float16Vector",
+                "DataType_BFloat16Vector",
+                "DataType_SparseFloatVector",
+                "DataType_Int8Vector",
+                "DataType_ArrayOfVector",
+                "DataType_ArrayOfStruct",
+                "DataType_Struct"
+            ]
+        },
+        "backuppb.DatabaseBackupInfo": {
+            "type": "object",
+            "properties": {
+                "db_id": {
+                    "type": "integer"
+                },
+                "db_name": {
+                    "type": "string"
+                },
+                "ezk": {
+                    "type": "string"
+                },
+                "properties": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                }
+            }
+        },
+        "backuppb.FieldSchema": {
+            "type": "object",
+            "properties": {
+                "autoID": {
+                    "type": "boolean"
+                },
+                "data_type": {
+                    "$ref": "#/definitions/backuppb.DataType"
+                },
+                "default_value": {
+                    "$ref": "#/definitions/backuppb.ValueField"
+                },
+                "default_value_base64": {
+                    "type": "string"
+                },
+                "default_value_proto": {
+                    "description": "Deprecated: Do not use.",
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "element_type": {
+                    "$ref": "#/definitions/backuppb.DataType"
+                },
+                "fieldID": {
+                    "type": "integer"
+                },
+                "index_params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "is_dynamic": {
+                    "type": "boolean"
+                },
+                "is_function_output": {
+                    "type": "boolean"
+                },
+                "is_partition_key": {
+                    "type": "boolean"
+                },
+                "is_primary_key": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "nullable": {
+                    "type": "boolean"
+                },
+                "state": {
+                    "$ref": "#/definitions/backuppb.FieldState"
+                },
+                "type_params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                }
+            }
+        },
+        "backuppb.FieldState": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2,
+                3
+            ],
+            "x-enum-varnames": [
+                "FieldState_FieldCreated",
+                "FieldState_FieldCreating",
+                "FieldState_FieldDropping",
+                "FieldState_FieldDropped"
+            ]
+        },
+        "backuppb.FunctionSchema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "input_field_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "input_field_names": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "output_field_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "output_field_names": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "type": {
+                    "$ref": "#/definitions/backuppb.FunctionType"
+                }
+            }
+        },
+        "backuppb.FunctionType": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2
+            ],
+            "x-enum-varnames": [
+                "FunctionType_Unknown",
+                "FunctionType_BM25",
+                "FunctionType_TextEmbedding"
+            ]
+        },
+        "backuppb.IndexInfo": {
+            "type": "object",
+            "properties": {
+                "create_time": {
+                    "type": "integer"
+                },
+                "field_id": {
+                    "description": "extra info from etcd",
+                    "type": "integer"
+                },
+                "field_name": {
+                    "type": "string"
+                },
+                "index_id": {
+                    "type": "integer"
+                },
+                "index_name": {
+                    "type": "string"
+                },
+                "index_params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "index_type": {
+                    "type": "string"
+                },
+                "is_auto_index": {
+                    "type": "boolean"
+                },
+                "max_index_version": {
+                    "type": "integer"
+                },
+                "min_index_version": {
+                    "type": "integer"
+                },
+                "params": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "type_params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                },
+                "user_index_params": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.KeyValuePair"
+                    }
+                }
+            }
+        },
+        "backuppb.KeyValuePair": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string"
+                },
+                "value": {
+                    "type": "string"
+                }
+            }
+        },
+        "backuppb.RPCChannelInfo": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "position": {
+                    "type": "string"
+                }
+            }
+        },
+        "backuppb.ResponseCode": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2,
+                3,
+                400,
+                404,
+                503
+            ],
+            "x-enum-varnames": [
+                "ResponseCode_Success",
+                "ResponseCode_Not_Support",
+                "ResponseCode_No_Permission",
+                "ResponseCode_Fail",
+                "ResponseCode_Parameter_Error",
+                "ResponseCode_Request_Object_Not_Found",
+                "ResponseCode_Storage_Not_Ready"
+            ]
+        },
+        "backuppb.RestoreTaskStateCode": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                0,
+                1,
+                2,
+                3,
+                4
+            ],
+            "x-enum-varnames": [
+                "RestoreTaskStateCode_INITIAL",
+                "RestoreTaskStateCode_EXECUTING",
+                "RestoreTaskStateCode_SUCCESS",
+                "RestoreTaskStateCode_FAIL",
+                "RestoreTaskStateCode_TIMEOUT"
+            ]
+        },
+        "backuppb.StructArrayFieldSchema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "fieldID": {
+                    "type": "integer"
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/backuppb.FieldSchema"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "nullable": {
+                    "description": "nullable is a struct-level flag: the server propagates it to every\nsub-field, and sub-fields must not be nullable unless it is set.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "backuppb.ValueField": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "description": "Types that are valid to be assigned to Data:\n\t*ValueField_BoolData\n\t*ValueField_IntData\n\t*ValueField_LongData\n\t*ValueField_FloatData\n\t*ValueField_DoubleData\n\t*ValueField_StringData\n\t*ValueField_BytesData"
+                }
+            }
+        }
+    }
+}

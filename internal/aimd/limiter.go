@@ -1,0 +1,112 @@
+package aimd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"go.uber.org/atomic"
+)
+
+// ErrStopped is returned by Wait when the limiter has been stopped.
+var ErrStopped = errors.New("aimd_limiter: limiter stopped")
+
+// Limiter is an implementation of Additive Increase Multiplicative Decrease algorithm.
+// It uses leaky bucket to limit the rate.
+type Limiter struct {
+	minRPS float64
+	maxRPS float64
+	curRPS atomic.Float64
+
+	bucket chan struct{}
+
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func NewLimiter(minRPS, maxRPS, initRPS float64) *Limiter {
+	a := &Limiter{
+		minRPS: minRPS,
+		maxRPS: maxRPS,
+		bucket: make(chan struct{}),
+		stop:   make(chan struct{}),
+	}
+	a.curRPS.Store(initRPS)
+
+	go a.loop()
+
+	return a
+}
+
+func (a *Limiter) loop() {
+	for {
+		every := time.Duration(float64(time.Second) / a.curRPS.Load())
+		select {
+		case <-time.After(every):
+			a.putToken()
+		case <-a.stop:
+			return
+		}
+	}
+}
+
+// putToken tries to put a token into the bucket.
+// It returns true if the token is put successfully.
+func (a *Limiter) putToken() {
+	select {
+	case a.bucket <- struct{}{}:
+	case <-a.stop:
+		return
+	}
+}
+
+func (a *Limiter) Wait(ctx context.Context) error {
+	select {
+	case <-a.bucket:
+		return nil
+	case <-a.stop:
+		return ErrStopped
+	case <-ctx.Done():
+		return fmt.Errorf("aimd_limiter: context canceled: %w", ctx.Err())
+	}
+}
+
+func (a *Limiter) Success() {
+	for {
+		oldRPS := a.curRPS.Load()
+		if oldRPS >= a.maxRPS {
+			return
+		}
+
+		newRPS := oldRPS + 1
+		if oldRPS < 1 {
+			newRPS = oldRPS + 0.1
+		}
+
+		if a.curRPS.CompareAndSwap(oldRPS, newRPS) {
+			return
+		}
+	}
+}
+
+func (a *Limiter) Failure() {
+	for {
+		oldRPS := a.curRPS.Load()
+		newRPS := oldRPS / 2
+		if newRPS <= a.minRPS {
+			newRPS = a.minRPS
+		}
+
+		if newRPS == oldRPS || a.curRPS.CompareAndSwap(oldRPS, newRPS) {
+			return
+		}
+	}
+}
+
+func (a *Limiter) CurRPS() float64 { return a.curRPS.Load() }
+
+func (a *Limiter) Stop() {
+	a.stopOnce.Do(func() { close(a.stop) })
+}

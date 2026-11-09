@@ -1,0 +1,189 @@
+# The schema version this file is written in. Required by v2.
+# A file without it is read as v1 and translated, which still works but is
+# deprecated: run `milvus-backup config migrate` to convert it.
+configVersion: v2
+
+# Configures the system log output.
+log:
+  level: info # Only supports debug, info, warn, error, panic, or fatal. Default 'info'.
+  console: true # whether print log to console
+  file:
+    path: "logs/backup.log"
+
+# The milvus-backup HTTP API server itself.
+server:
+  debugMode: false
+  # Set when the API is served behind a reverse proxy under a path prefix.
+  swaggerBasePath: ""
+
+# The Milvus deployment to back up, and the storage it keeps its data in.
+milvus:
+  user: "root"
+  password: "Milvus"
+
+  # The public gRPC endpoint, used for metadata, collection and database
+  # operations, flush, and RBAC.
+  grpc:
+    address: localhost
+    port: 19530
+
+    # disabled, server (verify the server certificate), or mutual (also present
+    # a client certificate).
+    tlsMode: disabled
+    # Verifies the server certificate. Used when tlsMode is server or mutual.
+    caCertPath: ""
+    serverName: ""
+    # The client key pair. Required when tlsMode is mutual.
+    mtlsCertPath: ""
+    mtlsKeyPath: ""
+
+  # The public REST endpoint, used for segment describe during backup and for
+  # import during restore. Derived from the gRPC connection when left empty,
+  # which covers deployments where one proxy serves both protocols.
+  rest:
+    endpoint: ""
+
+  # The Milvus internal management endpoint, serving GC pause/resume.
+  management:
+    endpoint: http://localhost:9091
+
+  replicate:
+    # Milvus replicate msg channel name, default is by-dev-replicate-msg
+    rpcChannelName: "by-dev-replicate-msg"
+
+  etcd:
+    endpoints:
+      - 127.0.0.1:2379
+    rootPath: "by-dev"
+
+  # Milvus storage configs, make them the same with milvus config.
+  storage:
+    # Supported providers: local, minio, s3, aws, gcp, gcpnative, azure,
+    # aliyun, tencent, hwc.
+    # local is Milvus standalone with COMMON_STORAGETYPE=local: there is no
+    # bucket or endpoint, and rootPath is the directory backing Milvus
+    # localStorage.path as milvus-backup sees it on disk. Optional localPath is
+    # the path the Milvus process itself resolves (for a container bind-mount);
+    # restore import paths use it. See configs/backup-local-milvus.yaml for a
+    # complete example.
+    provider: "minio"
+    address: localhost
+    port: 9000
+    region: ""
+    useSSL: false
+    # Verifies the storage certificate. Used when the endpoint is signed by a
+    # CA outside the system pool; requires useSSL, and does not apply to the
+    # gcp, gcpnative, and local providers.
+    # caCertPath: ""
+    # The Azure storage account. Required by the azure provider, and rejected
+    # for every other one.
+    # accountName: ""
+    # Milvus bucket name, make it the same as your milvus instance.
+    bucketName: "a-bucket"
+    # Milvus storage root path, make it the same as your milvus instance.
+    rootPath: "files"
+
+    # Only the credentials the chosen type uses may be set: naming one it does
+    # not use is a mistake, and is rejected rather than ignored.
+    auth:
+      # static: an access key pair. iam: fetched from an IAM endpoint.
+      # sharedKey: an Azure account key. serviceAccount: a GCP credentials
+      # file. default: resolved by the provider SDK.
+      type: static
+
+      # type: static
+      accessKeyID: minioadmin
+      secretAccessKey: minioadmin
+      # sessionToken: ""
+
+      # type: sharedKey, the Azure storage account key.
+      # accountKey: ""
+
+      # type: serviceAccount, path to the GCP service account JSON file.
+      # credentialsFile: ""
+
+      # type: iam, the endpoint credentials are fetched from. AWS and GCP read
+      # instance metadata from a well-known address, while MinIO needs one
+      # configured.
+      # endpoint: ""
+
+backup:
+  # Where backup data is written. Anything left out is inherited from
+  # milvus.storage, so a backup kept in the same backend only names what
+  # differs. rootPath is the exception and always defaults to "backup".
+  storage:
+    provider: "minio"
+    address: localhost
+    port: 9000
+    region: ""
+    useSSL: false
+    # Verifies the backup storage certificate, same rules as above.
+    # caCertPath: ""
+    # accountName: ""
+    # Backup data is stored under bucketName/rootPath.
+    bucketName: "a-bucket"
+    rootPath: "backup"
+
+    # The endpoint the Milvus server itself uses to reach this storage, when
+    # it differs from address/port above: a container port mapping, a private
+    # link, or an internal DNS name gives one store two endpoints. Snapshot
+    # URIs handed to Milvus must name the endpoint Milvus resolves. Left
+    # empty, a backup kept in the same backend as Milvus omits the endpoint
+    # from those URIs entirely and lets Milvus use its own storage config.
+    # milvusAddress: ""
+    # milvusPort: 0
+
+    auth:
+      type: static
+      accessKeyID: minioadmin
+      secretAccessKey: minioadmin
+      # sessionToken: ""
+      # accountKey: ""
+      # credentialsFile: ""
+      # endpoint: ""
+
+  concurrency:
+    # number of collections to backup in parallel.
+    collections: 4
+    # number of segments to backup in parallel
+    segments: 1024
+
+  # Pause GC during backup through the Milvus management endpoint.
+  pauseGC: true
+
+restore:
+  concurrency:
+    # Collection level parallelism to restore
+    collections: 2
+    # max number of import jobs to run in parallel,
+    # should be less than milvus's config dataCoord.import.maxImportJobNum
+    importJobs: 768
+
+  # max number of segments merged into one import job,
+  # should be less than milvus's config dataCoord.import.maxImportFileNumPerReq
+  maxSegmentsPerImportJob: 256
+
+  # keep temporary files during restore, only use to debug
+  keepTempFiles: false
+
+# How objects move between the two storage backends.
+transfer:
+  # auto asks the storage service to copy when both ends are the same backend,
+  # and streams through milvus-backup otherwise. direct always asks the storage
+  # service to copy; streaming always goes through milvus-backup.
+  mode: auto
+
+  # number of threads to copy data. reduce it if blocks your storage's network bandwidth
+  concurrency: 128
+
+  # File size threshold (MiB) above which multipart copy is used for
+  # S3-compatible storage. GCP does not support multipart copy and will always
+  # use single copy.
+  multipartCopyThresholdMiB: 500
+
+# Zilliz Cloud config.
+# If you want to migrate data to Zilliz Cloud, you need to configure the following parameters.
+# Otherwise, you can ignore it.
+zillizCloud:
+  endpoint: https://api.cloud.zilliz.com
+  apiKey: <your-api-key>
